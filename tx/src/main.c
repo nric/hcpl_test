@@ -151,7 +151,7 @@ static void adc_dma_setup(void) {
                    true,    // enable DMA data request
                    1,       // DREQ at least 1 sample
                    false,   // no ERR bit
-                   true);   // shift to 12-bit
+                   false);  // no shift, keep full 12-bit in 16-bit word
 
     adc_dma_chan = dma_claim_unused_channel(true);
     dma_channel_config c = dma_channel_get_default_config(adc_dma_chan);
