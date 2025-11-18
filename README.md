@@ -1,46 +1,59 @@
-# Current HCPL link test (PicoSDK)
+# Isolated Current Measurement Link (RP2040 Zero → HCPL2630 → Pico)
 
-## Code layout (current test)
-- `tx/` – RP2040 Zero transmitter, PicoSDK, USB CDC logging only (`stdio_init_all`). UART0 TX on GP0 at 1,000,000 baud, 8N2 (`tx/src/main.c`). Uses SLIP framing (0xC0 delimiter, 0xDB escapes) with CRC16-CCITT over the payload; frames are SLIP(payload + CRC16 big-endian). Each payload starts with a 32-bit sequence counter (little-endian) followed by an ID (short=0xA1, long=0xB2) and test data. Test mode sends a short and a long payload, auto-incrementing the sequence.
-- `rx/` – Pico receiver, PicoSDK, USB CDC logging only. UART0 RX on GP1 at 1,000,000 baud, 8N2 (`rx/src/main.c`). Line inversion is enabled in hardware (`gpio_set_inover`) to compensate for the HCPL2630 inversion. SLIP decode + CRC16 check; prints stats for good/failed frames, counts for the built-in short/long test payloads, reports the last CRC-failed frame bytes/CRC, tracks missed frames via the sequence counter, and totals bit-flip sum vs expected.
-- PlatformIO configs use the PicoSDK platform (`platform = https://github.com/maxgerhardt/platform-raspberrypi.git`, `PICO_STDIO_USB=1`, `PICO_STDIO_UART=0`).
+## Overview
+- TX (RP2040 Zero) reads an ACS712 current sensor on ADC0 (GPIO26), low-passes it with 9 kΩ / 1 nF, samples at a configured rate, and streams samples over UART0 through a HCPL-2630 isolator.
+- RX (Raspberry Pi Pico) receives on UART0 (inverted), SLIP-decodes frames, CRC-checks, tracks sequence gaps, and prints stats plus mean/min/max of the last good packet over USB-CDC (115200 baud).
+- Payload carries 16-bit samples (ADC is 12-bit); CRC16-CCITT protects each frame.
+- Note on rate: 1 Mbps at 8N2 tops out around ~45 k samples/s for 16-bit data once framing is included. The firmware currently targets `SAMPLE_RATE_HZ=40000` to stay within link budget; increase only if you also raise link speed or relax stop bits.
 
-## Protocol (unidirectional, SLIP + CRC16 + sequence)
-- Physical: UART0, TX=GP0, RX=GP1, 1,000,000 baud, 8 data bits, 2 stop bits, no parity (8N2). RX input is inverted in hardware to counter the HCPL2630 inversion (HCPL2630 inverts the signal).
-- Framing: SLIP (RFC1055-style). 0xC0 = END delimiter. 0xDB = ESC, with substitutions 0xDC (ESC_END) for literal 0xC0 and 0xDD (ESC_ESC) for literal 0xDB. Each frame is: `0xC0 | (payload+CRC escaped) | 0xC0`. Idle gaps of any length are allowed. If an END is seen mid-frame, the frame closes and CRC is checked.
+## Firmware layout
+- `tx/`: RP2040 Zero transmitter. USB CDC for logs only (UART stdio disabled). Samples ADC0 at `SAMPLE_RATE_HZ`, batches `SAMPLES_PER_FRAME` (default 40), frames them, and sends via UART0 TX on GP0 at 1,000,000 baud, 8N2. Source: `tx/src/main.c`.
+- `rx/`: Pico receiver. UART0 RX on GP1 (line inversion enabled in hardware to counter the HCPL2630), SLIP decode + CRC16 check, tracks seq gaps, and reports totals plus per-packet mean/min/max for the last valid frame. Source: `rx/src/main.c`.
+- PlatformIO uses the PicoSDK platform (`platform = https://github.com/maxgerhardt/platform-raspberrypi.git`, `PICO_STDIO_USB=1`, `PICO_STDIO_UART=0`).
+
+## Protocol (SLIP + CRC16 + sequence)
+- Physical: UART0, TX=GP0, RX=GP1, 1,000,000 baud, 8 data bits, 2 stop bits, no parity. RX input is inverted (`gpio_set_inover`) because the HCPL-2630 inverts the signal.
+- Framing: SLIP (0xC0 END, 0xDB ESC with 0xDC/0xDD substitutions). Each frame = `0xC0 | (payload+CRC escaped) | 0xC0`.
+- CRC: CRC16-CCITT (poly 0x1021, init 0xFFFF, no reflection) computed over the payload bytes, appended big-endian `[CRC_hi, CRC_lo]` before SLIP encoding.
 - Payload layout (little-endian sequence):
-  - Bytes 0..3: `seq` (uint32_t, increments each frame, wraps on overflow). RX tracks missed frames from gaps in `seq`.
-  - Byte 4: `id` (0xA1 = short test, 0xB2 = long test; replace with your application IDs as needed).
-  - Bytes 5..N: payload data.
-- Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF, reflect=false) computed over the SLIP-unescaped payload bytes (including `seq` and `id`), appended big-endian `[CRC_hi, CRC_lo]` before SLIP-encoding.
-- Test patterns used here:
-  - Short: `seq` (4 bytes) + 0xA1 + ASCII "SHORT" (5 bytes). Total = 10 bytes before CRC.
-  - Long: `seq` (4 bytes) + 0xB2 + ascending bytes 0x01..0x3C. Total = 69 bytes before CRC.
-- Error reporting (current RX implementation): counts CRC failures, too-short/too-long/timeouts, cumulative bit-flip sum for known test frames, missed frames from sequence gaps, and last failed frame dump (id/seq/len/CRCs + first bytes).
-- Framing: SLIP (0xC0 END delimiter, 0xDB ESC with 0xDC/0xDD substitutions). Each frame starts/ends at 0xC0; idle gaps of any length are fine (timeout logic clears partial frames after 15 s of silence).
-- Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF) computed over the payload, appended big-endian, and SLIP-encoded with the payload.
-- Test payloads: short frame starts with byte 0xA1 and string "SHORT"; long frame starts with 0xB2 followed by incrementing bytes. TX sends both in a loop with ~0.5–1.5 s spacing; RX counts them in stats.
+  - Bytes 0..3: `seq` (uint32_t, increments each frame, wraps on overflow). RX counts missed frames from gaps.
+  - Byte 4: `count` (uint8_t number of samples in this frame).
+  - Bytes 5..N: `count` samples, each 16-bit little-endian (`adc_read()` raw value, 12-bit significance).
 
-## Flashing
-- BOOTSEL mount appears at `/media/nric/RPI-RP2`.
-- TX flash: `cd /home/nric/src/current_hcpl_2/tx && PATH="$HOME/.platformio/penv/bin:$PATH" pio run -t upload --upload-port /media/nric/RPI-RP2`
-- RX flash: `cd /home/nric/src/current_hcpl_2/rx && PATH="$HOME/.platformio/penv/bin:$PATH" pio run -t upload --upload-port /media/nric/RPI-RP2`
-- USB CDC baud: 115200.
+## Hardware wiring
+### Power & isolation domains
+- Both boards are USB-powered from a common hub. Each uses its own 3.3 V regulator.
+- HCPL-2630 “output side” is powered from the RX Pico 3.3 V. “Input side” shares ground/supply with the TX RP2040 Zero.
+- Shielded cable recommended between HCPL output and RX, shield grounded at RX only.
 
-## Wiring (isolated via HCPL2630 as discussed)
+### Current sensor frontend (TX side, RP2040 Zero)
+- ACS712 (5 V module):
+  - VCC → 5 V (USB VBUS or 5 V rail on the Zero).
+  - GND → TX ground. Add 100 nF + 1 µF decoupling at the module.
+  - OUT → ADC0 (GPIO26) through 9 kΩ series resistor.
+  - 1 nF from ADC0 to GND (after the 9 kΩ) for RC anti-alias filter.
+  - Optional: Schottky clamps to 3.3 V and GND at ADC pin for over/under-voltage protection.
+
+### UART / isolation path
 - TX (RP2040 Zero):
   - GP0 (UART0 TX) → 220 Ω → HCPL2630 pin 1 (anode).
-  - GND → HCPL2630 pin 2 (cathode).
+  - TX GND → HCPL2630 pin 2 (cathode).
 - RX (Raspberry Pi Pico):
-  - HCPL2630 pin 8 → Pico 3.3 V.
-  - HCPL2630 pin 5 → Pico GND.
-  - 100 nF across pins 8–5.
-  - 550 Ω pull-up from pin 8 to pin 7.
-  - HCPL2630 pin 7 (open-collector out) → Pico GP1 (note: silkscreen “1” on top corresponds to GP1).
-  - Keep commons as above; USB hub supplies power/ground to both boards.
+  - HCPL2630 pin 8 → Pico 3.3 V; pin 5 → Pico GND; 100 nF across pins 8–5.
+  - Pull-up 550 Ω from pin 8 to pin 7.
+  - HCPL2630 pin 7 (open-collector out) → Pico GP1 (UART0 RX, inverted in software).
+  - Pico GP0 (UART0 TX) unused but kept set to UART function.
 
-## Notes / current debugging status
-- Scope shows clean 0xAA waveform at RX GP1 up to 1 Mbps.
-- Minimal test: TX sends 0xAA @1 kbaud; RX counts per second and toggles inversion. Typical log: inv=on ~40 aa /93 total; inv=off ~14 aa /93 total → inversion helps, but many bytes still “other” (not 0x55/0x00/0xFF), indicating framing/timing issues on the isolated path.
-- Action items: lock inversion on and dump actual bad byte values; try weaker pull-up on HCPL output (e.g., 1–2.2 kΩ vs 550 Ω); verify idle level on GP1; optionally drop baud to 300 to see if errors collapse.
-- Observation: with the asymmetric TX test pattern (1111001111001010101010 @ 10 kbaud + 1 ms low pause) GP1 on the RX Pico sees the pattern inverted after the HCPL2630 (logic levels flip). Account for this when interpreting waveforms or set RX inversion accordingly.
+## Flashing
+- BOOTSEL mount: `/media/nric/RPI-RP2`.
+- TX flash: `cd /home/nric/src/current_hcpl_2/tx && PATH="$HOME/.platformio/penv/bin:$PATH" pio run -t upload --upload-port /media/nric/RPI-RP2`
+- RX flash: `cd /home/nric/src/current_hcpl_2/rx && PATH="$HOME/.platformio/penv/bin:$PATH" pio run -t upload --upload-port /media/nric/RPI-RP2`
+- RX USB CDC: 115200 baud for logs.
+
+## What to expect on RX USB console
+- Periodic stats every 2 s: `ok`, `crc_fail`, `too_short`, `too_long`, `bad_len`, `timeout`, `bytes`, `missed_frames`, `seq_resets`.
+- Last good packet: `last_ok seq=<n> samples=<cnt> len=<payload_bytes> mean=<adc> min=<adc> max=<adc>`.
+- If a CRC fails, prints last failing seq/id/len/CRCs plus a short hex dump.
+
+## Tuning knobs
+- `tx/src/main.c`: `SAMPLE_RATE_HZ` (default 40 kHz) and `SAMPLES_PER_FRAME` (default 40) balance capture vs. link throughput. With 1 Mbps 8N2 and SLIP, ~40 k samples/s of 16-bit data is practical; sending full 100 kS/s raw would exceed link capacity unless baud/stop bits change or data is compressed.
