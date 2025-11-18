@@ -17,6 +17,12 @@
   - Short: `seq` (4 bytes) + 0xA1 + ASCII "SHORT" (5 bytes). Total = 10 bytes before CRC.
   - Long: `seq` (4 bytes) + 0xB2 + ascending bytes 0x01..0x3C. Total = 69 bytes before CRC.
 - Error reporting (current RX implementation): counts CRC failures, too-short/too-long/timeouts, cumulative bit-flip sum for known test frames, missed frames from sequence gaps, and last failed frame dump (id/seq/len/CRCs + first bytes).
+
+## Acquisition and streaming (TX behavior)
+- ADC capture: ADC0 @ ~100 ksps via DMA into a 32K-sample ring buffer (uint16_t). Ring size ≈ 64 KB (<70% of RP2040 RAM).
+- Decimation for link budget: every 4th sample is packed to 8-bit (12-bit >> 4), yielding ~25 ksps payload to fit 1 Mbaud 8N2. Remaining samples are dropped after consumption to keep RAM bounded.
+- Data frames: `id=0xD0`, payload = `seq` (4 bytes) + `id` + packed samples (up to 200 bytes per frame). Frames are emitted frequently (≤20 ms) to keep latency low. Short/long test frames still send periodically as keep-alives.
+- USB diagnostics: once per second, TX prints the raw ADC mean and sample count; RX reports data frame counts, mean/min/max of received packed samples, CRC stats, and missed frames.
 - Framing: SLIP (0xC0 END delimiter, 0xDB ESC with 0xDC/0xDD substitutions). Each frame starts/ends at 0xC0; idle gaps of any length are fine (timeout logic clears partial frames after 15 s of silence).
 - Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF) computed over the payload, appended big-endian, and SLIP-encoded with the payload.
 - Test payloads: short frame starts with byte 0xA1 and string "SHORT"; long frame starts with 0xB2 followed by incrementing bytes. TX sends both in a loop with ~0.5–1.5 s spacing; RX counts them in stats.
@@ -44,3 +50,9 @@
 - Minimal test: TX sends 0xAA @1 kbaud; RX counts per second and toggles inversion. Typical log: inv=on ~40 aa /93 total; inv=off ~14 aa /93 total → inversion helps, but many bytes still “other” (not 0x55/0x00/0xFF), indicating framing/timing issues on the isolated path.
 - Action items: lock inversion on and dump actual bad byte values; try weaker pull-up on HCPL output (e.g., 1–2.2 kΩ vs 550 Ω); verify idle level on GP1; optionally drop baud to 300 to see if errors collapse.
 - Observation: with the asymmetric TX test pattern (1111001111001010101010 @ 10 kbaud + 1 ms low pause) GP1 on the RX Pico sees the pattern inverted after the HCPL2630 (logic levels flip). Account for this when interpreting waveforms or set RX inversion accordingly.
+
+## ACS712 current sense wiring to TX (ADC capture)
+- Sensor: ACS712 module (5 A variant) wired to the TX RP2040 Zero.
+- Power: ACS712 Vcc → TX 5 V; ACS712 GND → TX GND.
+- Signal: ACS712 OUT → TX ADC0 (GPIO26). Optional RC filter (e.g., 1 kΩ + 10 nF) at the ADC pin to tame noise. Ensure the output never exceeds 3.3 V at the ADC (the ACS712 outputs ~Vcc/2 ± sensitivity, so stay within the safe current range or add clamping/divider as needed).
+- Load: run the measured conductor through the ACS712 IP+ / IP– terminals in series with the DUT supply.

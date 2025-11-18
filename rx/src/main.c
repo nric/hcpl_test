@@ -22,6 +22,7 @@
 
 #define TEST_SHORT_ID 0xA1
 #define TEST_LONG_ID 0xB2
+#define DATA_ID 0xD0
 #define SEQ_BYTES 4
 #define TEST_LONG_LEN 64
 #define TEST_SHORT_LEN 6
@@ -43,6 +44,11 @@ typedef struct {
     uint32_t crc_fail_bitflips;
     uint32_t missed_frames;
     uint32_t seq_resets;
+    uint32_t data_frames;
+    uint32_t data_samples;
+    uint32_t data_sum;
+    uint8_t data_min;
+    uint8_t data_max;
     bool last_seq_valid;
     uint32_t last_seq;
     bool last_fail_valid;
@@ -158,8 +164,26 @@ static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
 
     if (payload_len >= SEQ_BYTES + 1) {
         const uint8_t id = data[SEQ_BYTES];
-        if (payload_len == TEST_SHORT_TOTAL && id == TEST_SHORT_ID) st->test_short_ok++;
-        else if (payload_len == TEST_LONG_TOTAL && id == TEST_LONG_ID) st->test_long_ok++;
+        if (payload_len == TEST_SHORT_TOTAL && id == TEST_SHORT_ID) {
+            st->test_short_ok++;
+        } else if (payload_len == TEST_LONG_TOTAL && id == TEST_LONG_ID) {
+            st->test_long_ok++;
+        } else if (id == DATA_ID && payload_len > (SEQ_BYTES + 1)) {
+            const size_t count = payload_len - (SEQ_BYTES + 1);
+            const uint8_t *samples = &data[SEQ_BYTES + 1];
+            st->data_frames++;
+            st->data_samples += count;
+            for (size_t i = 0; i < count; ++i) {
+                uint8_t v = samples[i];
+                st->data_sum += v;
+                if (st->data_samples == count && i == 0) {
+                    st->data_min = st->data_max = v;
+                } else {
+                    if (v < st->data_min) st->data_min = v;
+                    if (v > st->data_max) st->data_max = v;
+                }
+            }
+        }
     }
 }
 
@@ -247,12 +271,15 @@ int main(void) {
 
         if (now_ms - last_report_ms >= STATS_PERIOD_MS) {
             last_report_ms = now_ms;
-            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu timeout=%lu bytes=%lu test_short=%lu test_long=%lu crc_fail_short=%lu crc_fail_long=%lu bitflips_sum=%lu missed_frames=%lu seq_resets=%lu",
+            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu timeout=%lu bytes=%lu test_short=%lu test_long=%lu crc_fail_short=%lu crc_fail_long=%lu data_frames=%lu data_samples=%lu data_mean=%lu data_min=%u data_max=%u bitflips_sum=%lu missed_frames=%lu seq_resets=%lu",
                    (unsigned long)st.frames_ok, (unsigned long)st.frames_crc_fail,
                    (unsigned long)st.frames_too_short, (unsigned long)st.frames_too_long,
                    (unsigned long)st.frames_timeout, (unsigned long)st.bytes_payload,
                    (unsigned long)st.test_short_ok, (unsigned long)st.test_long_ok,
                    (unsigned long)st.test_short_crc_fail, (unsigned long)st.test_long_crc_fail,
+                   (unsigned long)st.data_frames, (unsigned long)st.data_samples,
+                   st.data_samples ? (unsigned long)(st.data_sum / st.data_samples) : 0ul,
+                   st.data_samples ? st.data_min : 0, st.data_samples ? st.data_max : 0,
                    (unsigned long)st.crc_fail_bitflips, (unsigned long)st.missed_frames,
                    (unsigned long)st.seq_resets);
             if (st.last_fail_valid) {
