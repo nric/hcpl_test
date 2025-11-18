@@ -179,7 +179,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     uart_init(uart0, UART_BAUD);
-    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);  // higher throughput
+    uart_set_format(uart0, 8, 2, UART_PARITY_NONE);  // add stop bit margin at high baud
     uart_set_fifo_enabled(uart0, true);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
@@ -197,8 +197,11 @@ int main(void) {
     uint64_t last_mean_ms = to_ms_since_boot(get_absolute_time());
     uint64_t last_tx_test_ms = last_mean_ms;
     uint64_t last_data_tx_ms = last_mean_ms;
-    uint32_t mean_accum = 0;
+    uint64_t mean_accum = 0;
     uint32_t mean_count = 0;
+    uint16_t min_val = 0xFFFF;
+    uint16_t max_val = 0;
+    uint32_t uart_backoff_ms = 0;
     uint32_t decim_counter = 0;
     uint32_t consume_idx = 0;
 
@@ -211,6 +214,8 @@ int main(void) {
             consume_idx = (consume_idx + 1) & ADC_RING_MASK;
             mean_accum += sample;
             mean_count++;
+            if (sample < min_val) min_val = sample;
+            if (sample > max_val) max_val = sample;
             decim_counter++;
             if ((decim_counter % ADC_DECIM) == 0 && sample_buf_len < ADC_PACKET_SAMPLES) {
                 sample_buf[sample_buf_len++] = sample;  // full 12-bit raw
@@ -244,11 +249,18 @@ int main(void) {
         // 1s mean print (USB only)
         if (now_ms - last_mean_ms >= 1000) {
             uint32_t count = mean_count ? mean_count : 1;
-            printf("ADC mean=%lu (raw 12-bit), samples=%lu, data_seq=%lu\n",
-                   (unsigned long)(mean_accum / count), (unsigned long)mean_count, (unsigned long)data_seq);
-            mean_accum = 0;
-            mean_count = 0;
-            last_mean_ms = now_ms;
+            if (!uart_backoff_ms || (now_ms - last_mean_ms) >= uart_backoff_ms) {
+                const uint32_t mean = count ? (uint32_t)(mean_accum / count) : 0;
+                printf("ADC stats mean=%lu min=%u max=%u samples=%lu data_seq=%lu\n",
+                       (unsigned long)mean, (unsigned)min_val, (unsigned)max_val,
+                       (unsigned long)mean_count, (unsigned long)data_seq);
+                mean_accum = 0;
+                mean_count = 0;
+                min_val = 0xFFFF;
+                max_val = 0;
+                last_mean_ms = now_ms;
+                uart_backoff_ms = 500;
+            }
         }
 
         tight_loop_contents();

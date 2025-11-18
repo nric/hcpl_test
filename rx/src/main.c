@@ -62,6 +62,12 @@ typedef struct {
     uint8_t last_fail_dump[FAIL_DUMP_BYTES];
 } stats_t;
 
+// Windowed stats for 1s reporting
+static uint64_t data_sum_window = 0;
+static uint32_t data_count_window = 0;
+static uint16_t data_min_window = 0xFFFF;
+static uint16_t data_max_window = 0;
+
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; ++i) {
@@ -208,6 +214,27 @@ static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
             const uint8_t *samples = &data[SEQ_BYTES + 1];
             st->data_frames++;
             accumulate_data_samples(samples, count, st);
+            // Also track a 1s window for quick health check
+            size_t i = 0;
+            while (i + 2 < count) {
+                uint16_t s0 = (uint16_t)samples[i] | ((uint16_t)(samples[i + 1] & 0x0F) << 8);
+                uint16_t s1 = ((uint16_t)(samples[i + 1] >> 4) & 0x0F) | ((uint16_t)samples[i + 2] << 4);
+                data_sum_window += s0;
+                data_sum_window += s1;
+                data_count_window += 2;
+                if (s0 < data_min_window) data_min_window = s0;
+                if (s0 > data_max_window) data_max_window = s0;
+                if (s1 < data_min_window) data_min_window = s1;
+                if (s1 > data_max_window) data_max_window = s1;
+                i += 3;
+            }
+            if (i + 1 < count) {
+                uint16_t s0 = (uint16_t)samples[i] | ((uint16_t)(samples[i + 1] & 0x0F) << 8);
+                data_sum_window += s0;
+                data_count_window++;
+                if (s0 < data_min_window) data_min_window = s0;
+                if (s0 > data_max_window) data_max_window = s0;
+            }
         }
     }
 }
@@ -296,7 +323,8 @@ int main(void) {
 
         if (now_ms - last_report_ms >= STATS_PERIOD_MS) {
             last_report_ms = now_ms;
-            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu timeout=%lu bytes=%lu test_short=%lu test_long=%lu crc_fail_short=%lu crc_fail_long=%lu data_frames=%lu data_samples=%lu data_mean=%lu data_min=%u data_max=%u bitflips_sum=%lu missed_frames=%lu seq_resets=%lu",
+            const uint64_t window_mean = data_count_window ? data_sum_window / data_count_window : 0;
+            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu timeout=%lu bytes=%lu test_short=%lu test_long=%lu crc_fail_short=%lu crc_fail_long=%lu data_frames=%lu data_samples=%lu data_mean=%lu data_min=%u data_max=%u window_mean=%lu window_min=%u window_max=%u window_samples=%lu bitflips_sum=%lu missed_frames=%lu seq_resets=%lu",
                    (unsigned long)st.frames_ok, (unsigned long)st.frames_crc_fail,
                    (unsigned long)st.frames_too_short, (unsigned long)st.frames_too_long,
                    (unsigned long)st.frames_timeout, (unsigned long)st.bytes_payload,
@@ -305,6 +333,10 @@ int main(void) {
                    (unsigned long)st.data_frames, (unsigned long)st.data_samples,
                    st.data_samples ? (unsigned long)(st.data_sum / st.data_samples) : 0ul,
                    st.data_samples ? st.data_min : 0, st.data_samples ? st.data_max : 0,
+                   (unsigned long)window_mean,
+                   data_count_window ? data_min_window : 0,
+                   data_count_window ? data_max_window : 0,
+                   (unsigned long)data_count_window,
                    (unsigned long)st.crc_fail_bitflips, (unsigned long)st.missed_frames,
                    (unsigned long)st.seq_resets);
             if (st.last_fail_valid) {
@@ -316,6 +348,11 @@ int main(void) {
                 }
             }
             printf("\n");
+            // Reset window accumulators
+            data_sum_window = 0;
+            data_count_window = 0;
+            data_min_window = 0xFFFF;
+            data_max_window = 0;
         }
     }
 }
