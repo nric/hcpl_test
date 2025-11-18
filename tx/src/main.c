@@ -1,5 +1,6 @@
 #include <pico/stdlib.h>
 #include <pico/stdio_usb.h>
+#include <pico/stdio_uart.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -76,7 +77,8 @@ static void fill_long_test(uint8_t *buf, size_t len) {
 }
 
 int main(void) {
-    stdio_init_all();
+    stdio_usb_init();                     // USB CDC only
+    stdio_set_driver_enabled(&stdio_uart, false);  // hard-disable UART stdio
     setvbuf(stdout, NULL, _IONBF, 0);
 
     uart_init(uart0, UART_BAUD);
@@ -91,15 +93,11 @@ int main(void) {
     uint8_t long_payload[64];
     fill_long_test(long_payload, sizeof(long_payload));
 
-    printf("TX ready: UART0 @ %u baud on GP0, SLIP+CRC16. Sending test frames.\n", UART_BAUD);
-
     while (true) {
         send_frame(short_payload, sizeof(short_payload));
-        printf("TX sent short test (%u bytes payload)\n", (unsigned)sizeof(short_payload));
         sleep_ms(500);
 
         send_frame(long_payload, sizeof(long_payload));
-        printf("TX sent long test (%u bytes payload)\n", (unsigned)sizeof(long_payload));
         sleep_ms(1500);  // keep below 15s idle requirement
     }
 }
