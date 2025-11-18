@@ -4,13 +4,13 @@
 #include <stdio.h>
 #include <string.h>
 
-// Unidirectional framed TX at 100000 baud using SLIP-style framing + CRC16-CCITT.
+// Unidirectional framed TX at 1000000 baud using SLIP-style framing + CRC16-CCITT.
 // Frame: SLIP(CRC16(payload) appended big-endian). Delimiter is 0xC0 start/end.
 // Test mode repeatedly sends a short and long payload to exercise RX.
 
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1  // unused
-#define UART_BAUD 100000
+#define UART_BAUD 1000000
 
 #define SLIP_END 0xC0
 #define SLIP_ESC 0xDB
@@ -23,6 +23,11 @@
 // Test payload identifiers
 #define TEST_SHORT_ID 0xA1
 #define TEST_LONG_ID 0xB2
+#define SEQ_BYTES 4
+#define TEST_SHORT_LEN 6             // ID + "SHORT"
+#define TEST_LONG_LEN 64
+#define TEST_SHORT_TOTAL (SEQ_BYTES + TEST_SHORT_LEN)
+#define TEST_LONG_TOTAL (SEQ_BYTES + TEST_LONG_LEN)
 
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
     uint16_t crc = 0xFFFF;
@@ -69,10 +74,24 @@ static void send_frame(const uint8_t *payload, size_t len) {
     uart_write_blocking(uart0, encoded, encoded_len);
 }
 
-static void fill_long_test(uint8_t *buf, size_t len) {
-    buf[0] = TEST_LONG_ID;
-    for (size_t i = 1; i < len; ++i) {
-        buf[i] = (uint8_t)(i & 0xFF);
+static void build_short_payload(uint8_t *buf, uint32_t seq) {
+    buf[0] = (uint8_t)(seq & 0xFF);
+    buf[1] = (uint8_t)((seq >> 8) & 0xFF);
+    buf[2] = (uint8_t)((seq >> 16) & 0xFF);
+    buf[3] = (uint8_t)((seq >> 24) & 0xFF);
+    buf[4] = TEST_SHORT_ID;
+    const uint8_t text[TEST_SHORT_LEN - 1] = {'S', 'H', 'O', 'R', 'T'};
+    memcpy(&buf[5], text, sizeof(text));
+}
+
+static void build_long_payload(uint8_t *buf, uint32_t seq) {
+    buf[0] = (uint8_t)(seq & 0xFF);
+    buf[1] = (uint8_t)((seq >> 8) & 0xFF);
+    buf[2] = (uint8_t)((seq >> 16) & 0xFF);
+    buf[3] = (uint8_t)((seq >> 24) & 0xFF);
+    buf[4] = TEST_LONG_ID;
+    for (size_t i = 5; i < TEST_LONG_TOTAL; ++i) {
+        buf[i] = (uint8_t)((i - 4) & 0xFF);
     }
 }
 
@@ -89,14 +108,16 @@ int main(void) {
 
     sleep_ms(2000);  // allow USB enumerate
 
-    uint8_t short_payload[] = {TEST_SHORT_ID, 'S', 'H', 'O', 'R', 'T'};
-    uint8_t long_payload[64];
-    fill_long_test(long_payload, sizeof(long_payload));
+    uint32_t seq = 0;
+    uint8_t short_payload[TEST_SHORT_TOTAL];
+    uint8_t long_payload[TEST_LONG_TOTAL];
 
     while (true) {
+        build_short_payload(short_payload, seq++);
         send_frame(short_payload, sizeof(short_payload));
         sleep_ms(500);
 
+        build_long_payload(long_payload, seq++);
         send_frame(long_payload, sizeof(long_payload));
         sleep_ms(1500);  // keep below 15s idle requirement
     }
