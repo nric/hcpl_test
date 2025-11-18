@@ -2,14 +2,14 @@
 #include <stdio.h>
 #include <string.h>
 
-// RX: listens on UART0 GP1 at 1000000 baud, SLIP framing with CRC16-CCITT.
+// RX: listens on UART0 GP1 at 2500000 baud, SLIP framing with CRC16-CCITT.
 // Handles inverted line (HCPL2630 output) via GPIO in-over invert.
 // Reports frame statistics and recognizes built-in test frames.
 
 #define RX_PIN 1
 #define TX_PIN 0  // unused
 #define LED_PIN 25
-#define UART_BAUD 1000000
+#define UART_BAUD 2500000
 
 #define SLIP_END 0xC0
 #define SLIP_ESC 0xDB
@@ -196,7 +196,7 @@ int main(void) {
     gpio_put(LED_PIN, 0);
 
     uart_init(uart0, UART_BAUD);
-    uart_set_format(uart0, 8, 2, UART_PARITY_NONE);  // 2 stop bits for margin
+    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);  // 1 stop bit for throughput
     uart_set_fifo_enabled(uart0, true);
     gpio_set_function(RX_PIN, GPIO_FUNC_UART);
     gpio_set_function(TX_PIN, GPIO_FUNC_UART);

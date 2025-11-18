@@ -6,21 +6,21 @@
 #include <stdio.h>
 #include <string.h>
 
-// Unidirectional framed TX at 1000000 baud using SLIP-style framing + CRC16-CCITT.
+// Unidirectional framed TX at 2500000 baud using SLIP-style framing + CRC16-CCITT.
 // Frame: SLIP(CRC16(payload) appended big-endian). Delimiter is 0xC0 start/end.
 // Captures ADC (ACS712 current sense) at 100 ksps into a ring buffer (DMA),
-// streams decimated data frames with sequence counters, and prints a 1 s mean.
+// streams raw 16-bit data frames with sequence counters, and prints a 1 s mean.
 
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1  // unused
-#define UART_BAUD 1000000
+#define UART_BAUD 2500000
 
 #define SLIP_END 0xC0
 #define SLIP_ESC 0xDB
 #define SLIP_ESC_END 0xDC
 #define SLIP_ESC_ESC 0xDD
 
-#define MAX_PAYLOAD 256
+#define MAX_PAYLOAD 1024
 #define MAX_FRAME_ENCODED ((MAX_PAYLOAD + 2) * 2 + 2)  // worst case escapes + END delimiters
 
 // Test payload identifiers
@@ -37,8 +37,8 @@
 #define ADC_CHANNEL 0                  // GPIO26 / ADC0
 #define ADC_RING_SAMPLES 32768         // 32K samples -> 64 KB (fits under 70% RAM)
 #define ADC_RING_MASK (ADC_RING_SAMPLES - 1)
-#define ADC_DECIM 4                    // send 1 of every 4 samples (25 ksps payload)
-#define ADC_PACKET_SAMPLES 200         // decimated samples per data frame
+#define ADC_DECIM 1                    // no decimation (full rate)
+#define ADC_PACKET_SAMPLES 400         // samples per data frame (raw 16-bit)
 #define ADC_TARGET_KSPS 100.0f
 
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
@@ -107,13 +107,18 @@ static void build_long_payload(uint8_t *buf, uint32_t seq) {
     }
 }
 
-static void build_data_payload(uint8_t *buf, uint32_t seq, const uint8_t *samples, size_t count) {
+static void build_data_payload(uint8_t *buf, uint32_t seq, const uint16_t *samples, size_t count) {
     buf[0] = (uint8_t)(seq & 0xFF);
     buf[1] = (uint8_t)((seq >> 8) & 0xFF);
     buf[2] = (uint8_t)((seq >> 16) & 0xFF);
     buf[3] = (uint8_t)((seq >> 24) & 0xFF);
     buf[4] = DATA_ID;
-    memcpy(&buf[5], samples, count);
+    uint8_t *p = &buf[5];
+    for (size_t i = 0; i < count; ++i) {
+        uint16_t s = samples[i];
+        *p++ = (uint8_t)(s & 0xFF);
+        *p++ = (uint8_t)(s >> 8);
+    }
 }
 
 // ADC/DMA ring buffer
@@ -160,7 +165,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     uart_init(uart0, UART_BAUD);
-    uart_set_format(uart0, 8, 2, UART_PARITY_NONE);  // add margin with 2 stop bits
+    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);  // higher throughput
     uart_set_fifo_enabled(uart0, true);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
@@ -171,8 +176,8 @@ int main(void) {
     uint32_t seq = 0;
     uint8_t short_payload[TEST_SHORT_TOTAL];
     uint8_t long_payload[TEST_LONG_TOTAL];
-    uint8_t data_payload[5 + ADC_PACKET_SAMPLES];
-    uint8_t sample_buf[ADC_PACKET_SAMPLES];
+    uint8_t data_payload[5 + ADC_PACKET_SAMPLES * 2];
+    uint16_t sample_buf[ADC_PACKET_SAMPLES];
     size_t sample_buf_len = 0;
     uint32_t data_seq = 0;
     uint64_t last_mean_ms = to_ms_since_boot(get_absolute_time());
@@ -194,11 +199,11 @@ int main(void) {
             mean_count++;
             decim_counter++;
             if ((decim_counter % ADC_DECIM) == 0 && sample_buf_len < ADC_PACKET_SAMPLES) {
-                sample_buf[sample_buf_len++] = (uint8_t)(sample >> 4);  // 8-bit packed
+                sample_buf[sample_buf_len++] = sample;  // full 12-bit raw
             }
             if (sample_buf_len >= ADC_PACKET_SAMPLES) {
                 build_data_payload(data_payload, data_seq++, sample_buf, sample_buf_len);
-                send_frame(data_payload, 5 + sample_buf_len);
+                send_frame(data_payload, 5 + sample_buf_len * 2);
                 sample_buf_len = 0;
             }
         }
@@ -208,7 +213,7 @@ int main(void) {
         // Periodic data flush to keep latency bounded
         if (sample_buf_len > 0 && (now_ms - last_data_tx_ms) >= 20) {
             build_data_payload(data_payload, data_seq++, sample_buf, sample_buf_len);
-            send_frame(data_payload, 5 + sample_buf_len);
+            send_frame(data_payload, 5 + sample_buf_len * 2);
             sample_buf_len = 0;
             last_data_tx_ms = now_ms;
         }
