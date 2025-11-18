@@ -2,14 +2,14 @@
 #include <stdio.h>
 #include <string.h>
 
-// RX: listens on UART0 GP1 at 1000 baud, SLIP framing with CRC16-CCITT.
+// RX: listens on UART0 GP1 at 10000 baud, SLIP framing with CRC16-CCITT.
 // Handles inverted line (HCPL2630 output) via GPIO in-over invert.
 // Reports frame statistics and recognizes built-in test frames.
 
 #define RX_PIN 1
 #define TX_PIN 0  // unused
 #define LED_PIN 25
-#define UART_BAUD 1000
+#define UART_BAUD 10000
 
 #define SLIP_END 0xC0
 #define SLIP_ESC 0xDB
@@ -22,6 +22,9 @@
 
 #define TEST_SHORT_ID 0xA1
 #define TEST_LONG_ID 0xB2
+#define TEST_LONG_LEN 64
+#define TEST_SHORT_LEN 6
+#define FAIL_DUMP_BYTES 24
 
 typedef struct {
     uint32_t frames_ok;
@@ -32,6 +35,16 @@ typedef struct {
     uint32_t bytes_payload;
     uint32_t test_short_ok;
     uint32_t test_long_ok;
+    uint32_t test_short_crc_fail;
+    uint32_t test_long_crc_fail;
+    uint32_t crc_fail_bitflips;
+    bool last_fail_valid;
+    uint8_t last_fail_id;
+    uint16_t last_fail_crc_calc;
+    uint16_t last_fail_crc_rx;
+    size_t last_fail_len;
+    size_t last_fail_dump_len;
+    uint8_t last_fail_dump[FAIL_DUMP_BYTES];
 } stats_t;
 
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
@@ -45,6 +58,33 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
     return crc;
 }
 
+static size_t build_expected(uint8_t id, uint8_t *out, size_t max_len) {
+    if (id == TEST_SHORT_ID && max_len >= TEST_SHORT_LEN) {
+        const uint8_t exp[TEST_SHORT_LEN] = {TEST_SHORT_ID, 'S', 'H', 'O', 'R', 'T'};
+        memcpy(out, exp, TEST_SHORT_LEN);
+        return TEST_SHORT_LEN;
+    }
+    if (id == TEST_LONG_ID && max_len >= TEST_LONG_LEN) {
+        out[0] = TEST_LONG_ID;
+        for (size_t i = 1; i < TEST_LONG_LEN; ++i) {
+            out[i] = (uint8_t)(i & 0xFF);
+        }
+        return TEST_LONG_LEN;
+    }
+    return 0;
+}
+
+static uint32_t count_bitflips(const uint8_t *a, const uint8_t *b, size_t len) {
+    uint32_t flips = 0;
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t x = a[i] ^ b[i];
+        x = x - ((x >> 1) & 0x55);
+        x = (x & 0x33) + ((x >> 2) & 0x33);
+        flips += (((x + (x >> 4)) & 0x0F) * 0x01);
+    }
+    return flips;
+}
+
 static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
     if (len < 2) {
         st->frames_too_short++;
@@ -55,6 +95,21 @@ static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
     const uint16_t crc_rx = ((uint16_t)data[payload_len] << 8) | data[payload_len + 1];
     if (crc_calc != crc_rx) {
         st->frames_crc_fail++;
+        st->last_fail_valid = true;
+        st->last_fail_id = payload_len > 0 ? data[0] : 0x00;
+        st->last_fail_crc_calc = crc_calc;
+        st->last_fail_crc_rx = crc_rx;
+        st->last_fail_len = payload_len;
+        st->last_fail_dump_len = payload_len > FAIL_DUMP_BYTES ? FAIL_DUMP_BYTES : payload_len;
+        memcpy(st->last_fail_dump, data, st->last_fail_dump_len);
+
+        uint8_t exp[MAX_FRAME];
+        const size_t exp_len = build_expected(payload_len > 0 ? data[0] : 0x00, exp, sizeof(exp));
+        if (exp_len == payload_len && exp_len > 0) {
+            st->crc_fail_bitflips += count_bitflips(exp, data, exp_len);
+            if (data[0] == TEST_SHORT_ID) st->test_short_crc_fail++;
+            else if (data[0] == TEST_LONG_ID) st->test_long_crc_fail++;
+        }
         return;
     }
 
@@ -151,11 +206,22 @@ int main(void) {
 
         if (now_ms - last_report_ms >= STATS_PERIOD_MS) {
             last_report_ms = now_ms;
-            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu timeout=%lu bytes=%lu test_short=%lu test_long=%lu\n",
+            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu timeout=%lu bytes=%lu test_short=%lu test_long=%lu crc_fail_short=%lu crc_fail_long=%lu bitflips_sum=%lu",
                    (unsigned long)st.frames_ok, (unsigned long)st.frames_crc_fail,
                    (unsigned long)st.frames_too_short, (unsigned long)st.frames_too_long,
                    (unsigned long)st.frames_timeout, (unsigned long)st.bytes_payload,
-                   (unsigned long)st.test_short_ok, (unsigned long)st.test_long_ok);
+                   (unsigned long)st.test_short_ok, (unsigned long)st.test_long_ok,
+                   (unsigned long)st.test_short_crc_fail, (unsigned long)st.test_long_crc_fail,
+                   (unsigned long)st.crc_fail_bitflips);
+            if (st.last_fail_valid) {
+                printf(" last_fail id=0x%02X len=%lu crc_rx=0x%04X crc_calc=0x%04X dump=",
+                       st.last_fail_id, (unsigned long)st.last_fail_len,
+                       st.last_fail_crc_rx, st.last_fail_crc_calc);
+                for (size_t i = 0; i < st.last_fail_dump_len; ++i) {
+                    printf("%02X", st.last_fail_dump[i]);
+                }
+            }
+            printf("\n");
         }
     }
 }
