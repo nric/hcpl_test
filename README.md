@@ -1,12 +1,12 @@
 # Current HCPL link test (PicoSDK)
 
 ## Code layout (current test)
-- `tx/` – RP2040 Zero transmitter, PicoSDK, USB CDC logging only (`stdio_init_all`). UART0 TX on GP0 at 10,000 baud (`tx/src/main.c`). Uses SLIP framing (0xC0 delimiter, 0xDB escapes) with CRC16-CCITT over the payload; frames are SLIP(payload + CRC16 big-endian). Test mode repeatedly sends a short and a long payload.
-- `rx/` – Pico receiver, PicoSDK, USB CDC logging only. UART0 RX on GP1 at 10,000 baud (`rx/src/main.c`). Line inversion is enabled in hardware (`gpio_set_inover`) to compensate for the HCPL2630 inversion. SLIP decode + CRC16 check; prints stats for good/failed frames, counts for the built-in short/long test payloads, and reports the last CRC-failed frame bytes/CRC along with bit-flip sum vs expected.
+- `tx/` – RP2040 Zero transmitter, PicoSDK, USB CDC logging only (`stdio_init_all`). UART0 TX on GP0 at 100,000 baud, 8N2 (`tx/src/main.c`). Uses SLIP framing (0xC0 delimiter, 0xDB escapes) with CRC16-CCITT over the payload; frames are SLIP(payload + CRC16 big-endian). Test mode repeatedly sends a short and a long payload.
+- `rx/` – Pico receiver, PicoSDK, USB CDC logging only. UART0 RX on GP1 at 100,000 baud, 8N2 (`rx/src/main.c`). Line inversion is enabled in hardware (`gpio_set_inover`) to compensate for the HCPL2630 inversion. SLIP decode + CRC16 check; prints stats for good/failed frames, counts for the built-in short/long test payloads, and reports the last CRC-failed frame bytes/CRC along with bit-flip sum vs expected.
 - PlatformIO configs use the PicoSDK platform (`platform = https://github.com/maxgerhardt/platform-raspberrypi.git`, `PICO_STDIO_USB=1`, `PICO_STDIO_UART=0`).
 
 ## Protocol (unidirectional)
-- Physical: UART0, TX=GP0, RX=GP1, 10,000 baud, 8N1. RX input is inverted in hardware to counter the HCPL2630 inversion.
+- Physical: UART0, TX=GP0, RX=GP1, 100,000 baud, 8N2. RX input is inverted in hardware to counter the HCPL2630 inversion.
 - Framing: SLIP (0xC0 END delimiter, 0xDB ESC with 0xDC/0xDD substitutions). Each frame starts/ends at 0xC0; idle gaps of any length are fine (timeout logic clears partial frames after 15 s of silence).
 - Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF) computed over the payload, appended big-endian, and SLIP-encoded with the payload.
 - Test payloads: short frame starts with byte 0xA1 and string "SHORT"; long frame starts with 0xB2 followed by incrementing bytes. TX sends both in a loop with ~0.5–1.5 s spacing; RX counts them in stats.

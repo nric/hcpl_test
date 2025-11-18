@@ -4,13 +4,13 @@
 #include <stdio.h>
 #include <string.h>
 
-// Unidirectional framed TX at 10000 baud using SLIP-style framing + CRC16-CCITT.
+// Unidirectional framed TX at 100000 baud using SLIP-style framing + CRC16-CCITT.
 // Frame: SLIP(CRC16(payload) appended big-endian). Delimiter is 0xC0 start/end.
 // Test mode repeatedly sends a short and long payload to exercise RX.
 
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1  // unused
-#define UART_BAUD 10000
+#define UART_BAUD 100000
 
 #define SLIP_END 0xC0
 #define SLIP_ESC 0xDB
@@ -82,7 +82,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     uart_init(uart0, UART_BAUD);
-    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
+    uart_set_format(uart0, 8, 2, UART_PARITY_NONE);  // add margin with 2 stop bits
     uart_set_fifo_enabled(uart0, true);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
