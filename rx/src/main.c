@@ -18,7 +18,7 @@
 
 #define FRAME_TIMEOUT_MS 15000
 #define STATS_PERIOD_MS 2000
-#define MAX_FRAME 512
+#define MAX_FRAME 1200
 
 #define TEST_SHORT_ID 0xA1
 #define TEST_LONG_ID 0xB2
@@ -46,9 +46,10 @@ typedef struct {
     uint32_t seq_resets;
     uint32_t data_frames;
     uint32_t data_samples;
-    uint32_t data_sum;
-    uint8_t data_min;
-    uint8_t data_max;
+    uint64_t data_sum;
+    uint16_t data_min;
+    uint16_t data_max;
+    bool data_init;
     bool last_seq_valid;
     uint32_t last_seq;
     bool last_fail_valid;
@@ -106,6 +107,40 @@ static uint32_t count_bitflips(const uint8_t *a, const uint8_t *b, size_t len) {
         flips += (((x + (x >> 4)) & 0x0F) * 0x01);
     }
     return flips;
+}
+
+static void accumulate_data_samples(const uint8_t *bytes, size_t len, stats_t *st) {
+    size_t i = 0;
+    while (i + 2 < len) {
+        uint16_t s0 = (uint16_t)bytes[i] | ((uint16_t)(bytes[i + 1] & 0x0F) << 8);
+        uint16_t s1 = ((uint16_t)(bytes[i + 1] >> 4) & 0x0F) | ((uint16_t)bytes[i + 2] << 4);
+        uint16_t vals[2] = {s0, s1};
+        for (int v = 0; v < 2; ++v) {
+            uint16_t sample = vals[v];
+            st->data_samples++;
+            st->data_sum += sample;
+            if (!st->data_init) {
+                st->data_min = st->data_max = sample;
+                st->data_init = true;
+            } else {
+                if (sample < st->data_min) st->data_min = sample;
+                if (sample > st->data_max) st->data_max = sample;
+            }
+        }
+        i += 3;
+    }
+    if (i + 1 < len) {
+        uint16_t s0 = (uint16_t)bytes[i] | ((uint16_t)(bytes[i + 1] & 0x0F) << 8);
+        st->data_samples++;
+        st->data_sum += s0;
+        if (!st->data_init) {
+            st->data_min = st->data_max = s0;
+            st->data_init = true;
+        } else {
+            if (s0 < st->data_min) st->data_min = s0;
+            if (s0 > st->data_max) st->data_max = s0;
+        }
+    }
 }
 
 static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
@@ -172,17 +207,7 @@ static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
             const size_t count = payload_len - (SEQ_BYTES + 1);
             const uint8_t *samples = &data[SEQ_BYTES + 1];
             st->data_frames++;
-            st->data_samples += count;
-            for (size_t i = 0; i < count; ++i) {
-                uint8_t v = samples[i];
-                st->data_sum += v;
-                if (st->data_samples == count && i == 0) {
-                    st->data_min = st->data_max = v;
-                } else {
-                    if (v < st->data_min) st->data_min = v;
-                    if (v > st->data_max) st->data_max = v;
-                }
-            }
+            accumulate_data_samples(samples, count, st);
         }
     }
 }

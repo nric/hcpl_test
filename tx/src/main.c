@@ -9,7 +9,7 @@
 // Unidirectional framed TX at 2500000 baud using SLIP-style framing + CRC16-CCITT.
 // Frame: SLIP(CRC16(payload) appended big-endian). Delimiter is 0xC0 start/end.
 // Captures ADC (ACS712 current sense) at 100 ksps into a ring buffer (DMA),
-// streams raw 16-bit data frames with sequence counters, and prints a 1 s mean.
+// streams packed 12-bit data frames with sequence counters, and prints a 1 s mean.
 
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1  // unused
@@ -38,7 +38,7 @@
 #define ADC_RING_SAMPLES 32768         // 32K samples -> 64 KB (fits under 70% RAM)
 #define ADC_RING_MASK (ADC_RING_SAMPLES - 1)
 #define ADC_DECIM 1                    // no decimation (full rate)
-#define ADC_PACKET_SAMPLES 400         // samples per data frame (raw 16-bit)
+#define ADC_PACKET_SAMPLES 400         // samples per data frame (raw 12-bit, packed 2->3 bytes)
 #define ADC_TARGET_KSPS 100.0f
 
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
@@ -107,18 +107,32 @@ static void build_long_payload(uint8_t *buf, uint32_t seq) {
     }
 }
 
-static void build_data_payload(uint8_t *buf, uint32_t seq, const uint16_t *samples, size_t count) {
+static inline size_t pack_samples12(const uint16_t *samples, size_t count, uint8_t *out, size_t max_out) {
+    size_t o = 0;
+    size_t i = 0;
+    while (i + 1 < count && o + 3 <= max_out) {
+        uint16_t s0 = samples[i++] & 0x0FFFu;
+        uint16_t s1 = samples[i++] & 0x0FFFu;
+        out[o++] = (uint8_t)(s0 & 0xFF);
+        out[o++] = (uint8_t)(((s0 >> 8) & 0x0F) | ((s1 & 0x0F) << 4));
+        out[o++] = (uint8_t)((s1 >> 4) & 0xFF);
+    }
+    if (i < count && o + 2 <= max_out) {
+        uint16_t s0 = samples[i] & 0x0FFFu;
+        out[o++] = (uint8_t)(s0 & 0xFF);
+        out[o++] = (uint8_t)((s0 >> 8) & 0x0F);
+    }
+    return o;
+}
+
+static size_t build_data_payload(uint8_t *buf, uint32_t seq, const uint16_t *samples, size_t count) {
     buf[0] = (uint8_t)(seq & 0xFF);
     buf[1] = (uint8_t)((seq >> 8) & 0xFF);
     buf[2] = (uint8_t)((seq >> 16) & 0xFF);
     buf[3] = (uint8_t)((seq >> 24) & 0xFF);
     buf[4] = DATA_ID;
-    uint8_t *p = &buf[5];
-    for (size_t i = 0; i < count; ++i) {
-        uint16_t s = samples[i];
-        *p++ = (uint8_t)(s & 0xFF);
-        *p++ = (uint8_t)(s >> 8);
-    }
+    size_t packed = pack_samples12(samples, count, &buf[5], MAX_PAYLOAD - 5);
+    return 5 + packed;
 }
 
 // ADC/DMA ring buffer
@@ -202,8 +216,8 @@ int main(void) {
                 sample_buf[sample_buf_len++] = sample;  // full 12-bit raw
             }
             if (sample_buf_len >= ADC_PACKET_SAMPLES) {
-                build_data_payload(data_payload, data_seq++, sample_buf, sample_buf_len);
-                send_frame(data_payload, 5 + sample_buf_len * 2);
+                size_t payload_len = build_data_payload(data_payload, data_seq++, sample_buf, sample_buf_len);
+                send_frame(data_payload, payload_len);
                 sample_buf_len = 0;
             }
         }
@@ -212,8 +226,8 @@ int main(void) {
 
         // Periodic data flush to keep latency bounded
         if (sample_buf_len > 0 && (now_ms - last_data_tx_ms) >= 20) {
-            build_data_payload(data_payload, data_seq++, sample_buf, sample_buf_len);
-            send_frame(data_payload, 5 + sample_buf_len * 2);
+            size_t payload_len = build_data_payload(data_payload, data_seq++, sample_buf, sample_buf_len);
+            send_frame(data_payload, payload_len);
             sample_buf_len = 0;
             last_data_tx_ms = now_ms;
         }

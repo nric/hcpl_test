@@ -15,13 +15,13 @@
 - Test patterns used here:
   - Short: `seq` (4 bytes) + 0xA1 + ASCII "SHORT" (5 bytes). Total = 10 bytes before CRC.
   - Long: `seq` (4 bytes) + 0xB2 + ascending bytes 0x01..0x3C. Total = 69 bytes before CRC.
-- Data frame: `seq` (4 bytes) + 0xD0 + raw ADC samples, 16-bit little-endian per sample. TX uses packets of 400 samples by default (~805 bytes before CRC); frames are emitted frequently (≤20 ms) to keep up with ~100 ksps input.
+- Data frame: `seq` (4 bytes) + 0xD0 + raw ADC samples, packed 12-bit (two samples per 3 bytes; a final single sample uses 2 bytes). TX uses packets of 400 samples by default (~605 bytes before CRC); frames are emitted frequently (≤20 ms) to keep up with ~100 ksps input.
 - Error reporting (current RX implementation): counts CRC failures, too-short/too-long/timeouts, cumulative bit-flip sum for known test frames, missed frames from sequence gaps, last failed frame dump (id/seq/len/CRCs + first bytes), and aggregates stats for data frames (count, total samples, mean/min/max).
 
 ## Acquisition and streaming (TX behavior)
 - ADC capture: ADC0 @ ~100 ksps via DMA into a 32K-sample ring buffer (uint16_t). Ring size ≈ 64 KB (<70% of RP2040 RAM).
-- No decimation: all samples kept. Data frames pack 16-bit raw samples (little-endian). Current packet size is 400 samples → ~805 bytes before CRC; at 2.5 Mbaud 8N1 this fits with headroom.
-- Data frames: `id=0xD0`, payload = `seq` (4 bytes) + `id` + raw samples. Frames are emitted frequently (≤20 ms) to keep up with ~100 ksps input. Short/long test frames still send periodically as keep-alives.
+- No decimation: all samples kept. Data frames pack 12-bit raw samples (2 samples per 3 bytes; lone trailing sample uses 2 bytes). Current packet size: 400 samples → ~605 bytes before CRC; at 2.5 Mbaud 8N1 this fits with headroom.
+- Data frames: `id=0xD0`, payload = `seq` (4 bytes) + `id` + packed samples. Frames are emitted frequently (≤20 ms) to keep up with ~100 ksps input. Short/long test frames still send periodically as keep-alives.
 - USB diagnostics: once per second, TX prints the raw ADC mean and sample count; RX reports data frame counts, mean/min/max of received samples, CRC stats, and missed frames.
 - Framing: SLIP (0xC0 END delimiter, 0xDB ESC with 0xDC/0xDD substitutions). Each frame starts/ends at 0xC0; idle gaps of any length are fine (timeout logic clears partial frames after 15 s of silence).
 - Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF) computed over the payload, appended big-endian, and SLIP-encoded with the payload.
