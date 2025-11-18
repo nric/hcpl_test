@@ -1,9 +1,15 @@
 # Current HCPL link test (PicoSDK)
 
 ## Code layout (current test)
-- `tx/` – RP2040 Zero transmitter, PicoSDK, USB CDC logging only (`stdio_init_all`). UART0 TX on GP0. Current test firmware sends continuous `0xAA` at 1000 baud (`tx/src/main.c`), LED on GPIO25 blinks every 500 ms, USB prints “TX alive baud=1000”.
-- `rx/` – Pico receiver, PicoSDK, USB CDC logging only. UART0 RX on GP1. Current test firmware counts bytes once per second, prints good/bad plus histogram (aa/55/00/ff/other), and toggles RX input inversion each second to diagnose polarity (`rx/src/main.c`). LED blinks every second.
+- `tx/` – RP2040 Zero transmitter, PicoSDK, USB CDC logging only (`stdio_init_all`). UART0 TX on GP0 at 1000 baud (`tx/src/main.c`). Uses SLIP framing (0xC0 delimiter, 0xDB escapes) with CRC16-CCITT over the payload; frames are SLIP(payload + CRC16 big-endian). Test mode repeatedly sends a short and a long payload.
+- `rx/` – Pico receiver, PicoSDK, USB CDC logging only. UART0 RX on GP1 at 1000 baud (`rx/src/main.c`). Line inversion is enabled in hardware (`gpio_set_inover`) to compensate for the HCPL2630 inversion. SLIP decode + CRC16 check; prints stats for good/failed frames and counts for the built-in short/long test payloads. LED blinks every second.
 - PlatformIO configs use the PicoSDK platform (`platform = https://github.com/maxgerhardt/platform-raspberrypi.git`, `PICO_STDIO_USB=1`, `PICO_STDIO_UART=0`).
+
+## Protocol (unidirectional)
+- Physical: UART0, TX=GP0, RX=GP1, 1000 baud, 8N1. RX input is inverted in hardware to counter the HCPL2630 inversion.
+- Framing: SLIP (0xC0 END delimiter, 0xDB ESC with 0xDC/0xDD substitutions). Each frame starts/ends at 0xC0; idle gaps of any length are fine (timeout logic clears partial frames after 15 s of silence).
+- Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF) computed over the payload, appended big-endian, and SLIP-encoded with the payload.
+- Test payloads: short frame starts with byte 0xA1 and string "SHORT"; long frame starts with 0xB2 followed by incrementing bytes. TX sends both in a loop with ~0.5–1.5 s spacing; RX counts them in stats.
 
 ## Flashing
 - BOOTSEL mount appears at `/media/nric/RPI-RP2`.

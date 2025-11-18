@@ -1,74 +1,161 @@
 #include <pico/stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
-// Minimal RX with inversion toggle: UART0 RX on GP1, expect continuous 0xAA at 1000 baud.
-// Counts bytes per 1s window, prints histogram, and flips inversion each window to diagnose polarity.
-// LED on GPIO25 blinks every second.
+// RX: listens on UART0 GP1 at 1000 baud, SLIP framing with CRC16-CCITT.
+// Handles inverted line (HCPL2630 output) via GPIO in-over invert.
+// Reports frame statistics and recognizes built-in test frames.
 
 #define RX_PIN 1
 #define TX_PIN 0  // unused
 #define LED_PIN 25
-#define BAUD 1000
-#define EXPECT_BYTE 0xAA
+#define UART_BAUD 1000
 
-static void set_invert(bool inv) {
-    gpio_set_inover(RX_PIN, inv ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL);
+#define SLIP_END 0xC0
+#define SLIP_ESC 0xDB
+#define SLIP_ESC_END 0xDC
+#define SLIP_ESC_ESC 0xDD
+
+#define FRAME_TIMEOUT_MS 15000
+#define STATS_PERIOD_MS 2000
+#define MAX_FRAME 512
+
+#define TEST_SHORT_ID 0xA1
+#define TEST_LONG_ID 0xB2
+
+typedef struct {
+    uint32_t frames_ok;
+    uint32_t frames_crc_fail;
+    uint32_t frames_too_short;
+    uint32_t frames_too_long;
+    uint32_t frames_timeout;
+    uint32_t bytes_payload;
+    uint32_t test_short_ok;
+    uint32_t test_long_ok;
+} stats_t;
+
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+        }
+    }
+    return crc;
+}
+
+static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
+    if (len < 2) {
+        st->frames_too_short++;
+        return;
+    }
+    const size_t payload_len = len - 2;
+    const uint16_t crc_calc = crc16_ccitt(data, payload_len);
+    const uint16_t crc_rx = ((uint16_t)data[payload_len] << 8) | data[payload_len + 1];
+    if (crc_calc != crc_rx) {
+        st->frames_crc_fail++;
+        return;
+    }
+
+    st->frames_ok++;
+    st->bytes_payload += payload_len;
+
+    if (payload_len > 0) {
+        if (data[0] == TEST_SHORT_ID) st->test_short_ok++;
+        else if (data[0] == TEST_LONG_ID) st->test_long_ok++;
+    }
 }
 
 int main(void) {
     stdio_init_all();
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 0);
 
-    uart_init(uart0, BAUD);
+    uart_init(uart0, UART_BAUD);
     uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
     uart_set_fifo_enabled(uart0, true);
     gpio_set_function(RX_PIN, GPIO_FUNC_UART);
     gpio_set_function(TX_PIN, GPIO_FUNC_UART);
+    gpio_set_inover(RX_PIN, GPIO_OVERRIDE_INVERT);  // HCPL2630 inverts the signal
 
     sleep_ms(2000);  // allow USB CDC to enumerate
+    printf("RX ready: UART0 GP1 inverted, %u baud, SLIP+CRC16 listening...\n", UART_BAUD);
 
-    bool invert = true;  // start inverted for HCPL path
-    set_invert(invert);
-    printf("RX boot: GP1 @ %u baud, expect 0x%02X, invert=%s (toggles each second)\n",
-           BAUD, EXPECT_BYTE, invert ? "on" : "off");
-
-    uint64_t last_report = to_ms_since_boot(get_absolute_time());
-    uint64_t last_led = last_report;
-    uint32_t total = 0;
-    uint32_t good = 0;
-    uint32_t count_aa = 0, count_55 = 0, count_00 = 0, count_ff = 0, count_other = 0;
+    uint8_t frame_buf[MAX_FRAME];
+    size_t frame_len = 0;
+    bool esc = false;
+    bool overflow = false;
+    stats_t st = {0};
+    uint64_t last_byte_ms = to_ms_since_boot(get_absolute_time());
+    uint64_t last_report_ms = last_byte_ms;
+    uint64_t last_led_ms = last_byte_ms;
 
     while (true) {
         while (uart_is_readable(uart0)) {
             uint8_t b = (uint8_t)uart_getc(uart0);
-            total++;
-            if (b == EXPECT_BYTE) good++;
-            if (b == 0xAA) count_aa++;
-            else if (b == 0x55) count_55++;
-            else if (b == 0x00) count_00++;
-            else if (b == 0xFF) count_ff++;
-            else count_other++;
+            last_byte_ms = to_ms_since_boot(get_absolute_time());
+
+            if (overflow) {
+                if (b == SLIP_END) {
+                    st.frames_too_long++;
+                    frame_len = 0;
+                    esc = false;
+                    overflow = false;
+                }
+                continue;
+            }
+
+            if (b == SLIP_END) {
+                if (frame_len > 0) {
+                    process_frame(frame_buf, frame_len, &st);
+                    frame_len = 0;
+                }
+                esc = false;
+                continue;
+            }
+
+            if (b == SLIP_ESC) {
+                esc = true;
+                continue;
+            }
+
+            if (esc) {
+                if (b == SLIP_ESC_END) b = SLIP_END;
+                else if (b == SLIP_ESC_ESC) b = SLIP_ESC;
+                esc = false;
+            }
+
+            if (frame_len < MAX_FRAME) {
+                frame_buf[frame_len++] = b;
+            } else {
+                overflow = true;
+            }
         }
-        const uint64_t now = to_ms_since_boot(get_absolute_time());
-        if (now - last_led >= 1000) {
-            last_led = now;
+
+        const uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+        if (frame_len > 0 && (now_ms - last_byte_ms) > FRAME_TIMEOUT_MS) {
+            st.frames_timeout++;
+            frame_len = 0;
+            esc = false;
+            overflow = false;
+        }
+
+        if (now_ms - last_led_ms >= 1000) {
+            last_led_ms = now_ms;
             gpio_xor_mask(1u << LED_PIN);
         }
-        if (now - last_report >= 1000) {
-            last_report = now;
-            printf("RX stats inv=%s total=%lu good=%lu bad=%lu aa=%lu 55=%lu 00=%lu ff=%lu other=%lu\n",
-                   invert ? "on" : "off",
-                   (unsigned long)total, (unsigned long)good,
-                   (unsigned long)(total - good),
-                   (unsigned long)count_aa, (unsigned long)count_55,
-                   (unsigned long)count_00, (unsigned long)count_ff,
-                   (unsigned long)count_other);
-            total = good = count_aa = count_55 = count_00 = count_ff = count_other = 0;
-            invert = !invert;
-            set_invert(invert);
+
+        if (now_ms - last_report_ms >= STATS_PERIOD_MS) {
+            last_report_ms = now_ms;
+            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu timeout=%lu bytes=%lu test_short=%lu test_long=%lu\n",
+                   (unsigned long)st.frames_ok, (unsigned long)st.frames_crc_fail,
+                   (unsigned long)st.frames_too_short, (unsigned long)st.frames_too_long,
+                   (unsigned long)st.frames_timeout, (unsigned long)st.bytes_payload,
+                   (unsigned long)st.test_short_ok, (unsigned long)st.test_long_ok);
         }
     }
 }
