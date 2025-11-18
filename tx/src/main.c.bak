@@ -1,0 +1,95 @@
+#include <pico/stdlib.h>
+#include <pico/stdio_usb.h>
+#include <stdio.h>
+#include <string.h>
+#include <hardware/uart.h>
+#include <hardware/regs/uart.h>
+
+// TX board: RP2040 Zero (UART0 TX on default GP0) sending test frames to HCPL2630.
+// USB CDC is the only stdout; UART0 is dedicated to the isolated link.
+
+#define UART0_TX_PIN 0
+#define UART0_RX_PIN 1  // unused, set for completeness
+#define UART_BAUD 1000
+#define LED_PIN 25      // fallback LED; works on Pico and many RP2040 boards
+
+#define PREAMBLE1 0xA5
+#define PREAMBLE2 0x5A
+#define FRAME_LEN 13
+#define INVERT_TX 1  // set to 1 when driving HCPL2630 (inverting isolator)
+
+static uint8_t frame_buf[FRAME_LEN] = {
+    PREAMBLE1, PREAMBLE2, 0x00, 0x00, 0xAA, 0x55, 0xF0,
+    0x0F,      0xCC,      0x33, 0x00, 0x00, 0x00,
+};
+
+static uint16_t sequence = 0;
+
+static uint8_t checksum(const uint8_t *data, size_t len) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < len; ++i) {
+        sum ^= data[i];
+    }
+    return sum;
+}
+
+static void build_frame(void) {
+    frame_buf[2] = (uint8_t)(sequence & 0xFF);
+    frame_buf[3] = (uint8_t)((sequence >> 8) & 0xFF);
+    frame_buf[10] = frame_buf[2] ^ 0xFF;
+    frame_buf[11] = frame_buf[3] ^ 0xFF;
+    frame_buf[12] = checksum(frame_buf, FRAME_LEN - 1);
+}
+
+static void send_frame(void) {
+    build_frame();
+    for (size_t i = 0; i < FRAME_LEN; ++i) {
+        while (!uart_is_writable(uart0)) {
+            tight_loop_contents();
+        }
+        uart_putc_raw(uart0, frame_buf[i]);
+    }
+    sequence++;
+}
+
+int main(void) {
+    stdio_usb_init();
+
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, 0);
+
+    uart_init(uart0, UART_BAUD);
+    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(uart0, true);
+    gpio_set_function(UART0_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART0_RX_PIN, GPIO_FUNC_UART);
+#if INVERT_TX
+    gpio_set_outover(UART0_TX_PIN, GPIO_OVERRIDE_INVERT);
+#else
+    gpio_set_outover(UART0_TX_PIN, GPIO_OVERRIDE_NORMAL);
+#endif
+
+    // allow USB to enumerate
+    sleep_ms(2000);
+
+    uint64_t last_report_ms = to_ms_since_boot(get_absolute_time());
+    bool led_state = false;
+
+    while (true) {
+        send_frame();
+
+        const uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+        if (now_ms - last_report_ms >= 500) {
+            last_report_ms = now_ms;
+            led_state = !led_state;
+            gpio_put(LED_PIN, led_state);
+            printf("TX alive baud=%lu seq=%u\n", (unsigned long)UART_BAUD, (unsigned)sequence);
+        }
+        
+        // Wait for the UART to finish sending before looping again.
+        while (!(uart_get_hw(uart0)->fr & UART_UARTFR_TXFE_BITS)) {
+            tight_loop_contents();
+        }
+    }
+}
