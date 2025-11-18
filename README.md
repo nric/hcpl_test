@@ -5,8 +5,18 @@
 - `rx/` – Pico receiver, PicoSDK, USB CDC logging only. UART0 RX on GP1 at 1,000,000 baud, 8N2 (`rx/src/main.c`). Line inversion is enabled in hardware (`gpio_set_inover`) to compensate for the HCPL2630 inversion. SLIP decode + CRC16 check; prints stats for good/failed frames, counts for the built-in short/long test payloads, reports the last CRC-failed frame bytes/CRC, tracks missed frames via the sequence counter, and totals bit-flip sum vs expected.
 - PlatformIO configs use the PicoSDK platform (`platform = https://github.com/maxgerhardt/platform-raspberrypi.git`, `PICO_STDIO_USB=1`, `PICO_STDIO_UART=0`).
 
-## Protocol (unidirectional)
-- Physical: UART0, TX=GP0, RX=GP1, 1,000,000 baud, 8N2. RX input is inverted in hardware to counter the HCPL2630 inversion.
+## Protocol (unidirectional, SLIP + CRC16 + sequence)
+- Physical: UART0, TX=GP0, RX=GP1, 1,000,000 baud, 8 data bits, 2 stop bits, no parity (8N2). RX input is inverted in hardware to counter the HCPL2630 inversion (HCPL2630 inverts the signal).
+- Framing: SLIP (RFC1055-style). 0xC0 = END delimiter. 0xDB = ESC, with substitutions 0xDC (ESC_END) for literal 0xC0 and 0xDD (ESC_ESC) for literal 0xDB. Each frame is: `0xC0 | (payload+CRC escaped) | 0xC0`. Idle gaps of any length are allowed. If an END is seen mid-frame, the frame closes and CRC is checked.
+- Payload layout (little-endian sequence):
+  - Bytes 0..3: `seq` (uint32_t, increments each frame, wraps on overflow). RX tracks missed frames from gaps in `seq`.
+  - Byte 4: `id` (0xA1 = short test, 0xB2 = long test; replace with your application IDs as needed).
+  - Bytes 5..N: payload data.
+- Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF, reflect=false) computed over the SLIP-unescaped payload bytes (including `seq` and `id`), appended big-endian `[CRC_hi, CRC_lo]` before SLIP-encoding.
+- Test patterns used here:
+  - Short: `seq` (4 bytes) + 0xA1 + ASCII "SHORT" (5 bytes). Total = 10 bytes before CRC.
+  - Long: `seq` (4 bytes) + 0xB2 + ascending bytes 0x01..0x3C. Total = 69 bytes before CRC.
+- Error reporting (current RX implementation): counts CRC failures, too-short/too-long/timeouts, cumulative bit-flip sum for known test frames, missed frames from sequence gaps, and last failed frame dump (id/seq/len/CRCs + first bytes).
 - Framing: SLIP (0xC0 END delimiter, 0xDB ESC with 0xDC/0xDD substitutions). Each frame starts/ends at 0xC0; idle gaps of any length are fine (timeout logic clears partial frames after 15 s of silence).
 - Integrity: CRC16-CCITT (poly 0x1021, init 0xFFFF) computed over the payload, appended big-endian, and SLIP-encoded with the payload.
 - Test payloads: short frame starts with byte 0xA1 and string "SHORT"; long frame starts with 0xB2 followed by incrementing bytes. TX sends both in a loop with ~0.5–1.5 s spacing; RX counts them in stats.
