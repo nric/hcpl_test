@@ -5,12 +5,12 @@ This is a development project that will enable the measurment of the current (an
 ## Overview
 - TX (RP2040 Zero) reads an ACS712 current sensor on ADC0 (GPIO26), low-passes it with 9 kΩ / 1 nF, samples at a configured rate, and streams samples over UART0 through a HCPL-2630 isolator.
 - RX (Raspberry Pi Pico) receives on UART0 (inverted), SLIP-decodes frames, CRC-checks, tracks sequence gaps, and prints stats plus mean/min/max of the last good packet over USB-CDC (115200 baud).
-- Payload carries 16-bit samples (ADC is 12-bit); CRC16-CCITT protects each frame.
+- Payload carries 12-bit packed samples (3 bytes per 2 samples); CRC16-CCITT protects each frame.
 - Note on rate: 1 Mbps at 8N2 tops out around ~45 k samples/s for 16-bit data once framing is included. The firmware currently targets `SAMPLE_RATE_HZ=40000` to stay within link budget; increase only if you also raise link speed or relax stop bits.
 
 ## Firmware layout
-- `tx/`: RP2040 Zero transmitter. USB CDC for logs only (UART stdio disabled). Samples ADC0 at `SAMPLE_RATE_HZ`, batches `SAMPLES_PER_FRAME` (default 40), frames them, and sends via UART0 TX on GP0 at 1,000,000 baud, 8N2. Source: `tx/src/main.c`.
-- `rx/`: Pico receiver. UART0 RX on GP1 (line inversion enabled in hardware to counter the HCPL2630), SLIP decode + CRC16 check, tracks seq gaps, and reports totals plus per-packet mean/min/max for the last valid frame. Source: `rx/src/main.c`.
+- `tx/`: RP2040 Zero transmitter. USB CDC for logs only (UART stdio disabled). Samples ADC0 at `SAMPLE_RATE_HZ`, batches `SAMPLES_PER_FRAME` (default 40), frames them using 12-bit packing (2 samples in 3 bytes), and sends via UART0 TX on GP0 at 1,000,000 baud, 8N2. Source: `tx/src/main.c`.
+- `rx/`: Pico receiver. UART0 RX on GP1 (line inversion enabled in hardware to counter the HCPL2630), SLIP decode + CRC16 check. Uses an **interrupt-driven UART with a large ring buffer** to prevent data loss. Tracks seq gaps, and reports totals plus per-packet mean/min/max for the last valid frame. Source: `rx/src/main.c`.
 - PlatformIO uses the PicoSDK platform (`platform = https://github.com/maxgerhardt/platform-raspberrypi.git`, `PICO_STDIO_USB=1`, `PICO_STDIO_UART=0`).
 
 ## Protocol (SLIP + CRC16 + sequence)
@@ -20,7 +20,11 @@ This is a development project that will enable the measurment of the current (an
 - Payload layout (little-endian sequence):
   - Bytes 0..3: `seq` (uint32_t, increments each frame, wraps on overflow). RX counts missed frames from gaps.
   - Byte 4: `count` (uint8_t number of samples in this frame).
-  - Bytes 5..N: `count` samples, each 16-bit little-endian (`adc_read()` raw value, 12-bit significance).
+  - Bytes 5..N: Packed 12-bit samples. Every 2 samples occupy 3 bytes.
+    - **Byte 0**: Sample A [7:0]
+    - **Byte 1**: Sample A [11:8] (lower nibble) | Sample B [3:0] (upper nibble)
+    - **Byte 2**: Sample B [11:4]
+    - If `count` is odd, the last sample uses 2 bytes (padded).
 
 ## Hardware wiring
 ### Power & isolation domains
@@ -55,6 +59,7 @@ This is a development project that will enable the measurment of the current (an
 
 ## What to expect on RX USB console
 - Periodic stats every 2 s: `ok`, `crc_fail`, `too_short`, `too_long`, `bad_len`, `timeout`, `bytes`, `missed_frames`, `seq_resets`.
+- Hardware/Buffer errors: `overrun`, `break`, `parity`, `framing`, `ring_buffer_overflow`.
 - Last good packet: `last_ok seq=<n> samples=<cnt> len=<payload_bytes> mean=<adc> min=<adc> max=<adc>`.
 - If a CRC fails, prints last failing seq/id/len/CRCs plus a short hex dump.
 
