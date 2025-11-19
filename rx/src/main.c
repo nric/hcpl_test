@@ -1,14 +1,18 @@
 #include <pico/stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <hardware/uart.h>
 #include <hardware/irq.h>
 
 // RX: listens on UART0 GP1 at 1000000 baud, SLIP framing with CRC16-CCITT.
 // Handles inverted line (HCPL2630 output) via GPIO in-over invert.
-// Reports frame statistics and per-packet ADC sample stats (mean/min/max).
-// Uses interrupt-driven RX with a large ring buffer to prevent data loss.
-// Unpacks 12-bit samples (2 samples per 3 bytes).
+// Triggered Capture Mode:
+// 1. Wait for first valid packet -> Calculate Baseline (Mean, StdDev).
+// 2. Monitor stream -> Trigger if sample > Mean + 5*StdDev or < Mean - 5*StdDev.
+// 3. Capture buffer of samples.
+// 4. Report stats + raw values.
+// 5. Return to Monitor.
 
 #define RX_PIN 1
 #define TX_PIN 0  // unused
@@ -21,74 +25,50 @@
 #define SLIP_ESC_ESC 0xDD
 
 #define FRAME_TIMEOUT_MS 15000
-#define STATS_PERIOD_MS 2000
 #define MAX_FRAME 512
-
 #define SEQ_BYTES 4
-#define FAIL_DUMP_BYTES 24
-
 #define RX_BUFFER_SIZE 8192
 
+#define CAPTURE_BUFFER_SIZE 1000
+
+typedef enum {
+    STATE_WAIT_FOR_BASELINE,
+    STATE_MONITOR,
+    STATE_CAPTURE,
+    STATE_REPORT
+} rx_state_t;
+
 typedef struct {
+    rx_state_t state;
+    
+    // Baseline stats
+    double baseline_mean;
+    double baseline_std_dev;
+    bool baseline_valid;
+
+    // Capture buffer
+    uint16_t capture_buf[CAPTURE_BUFFER_SIZE];
+    size_t capture_idx;
+
+    // General stats (kept for debugging if needed, but less verbose now)
     uint32_t frames_ok;
     uint32_t frames_crc_fail;
-    uint32_t frames_too_short;
-    uint32_t frames_too_long;
-    uint32_t frames_bad_len;
-    uint32_t frames_timeout;
-    uint32_t bytes_payload;
-    uint32_t missed_frames;
-    uint32_t seq_resets;
-    
-    // UART HW errors
-    uint32_t uart_overrun_err;
-    uint32_t uart_break_err;
-    uint32_t uart_parity_err;
-    uint32_t uart_framing_err;
-    uint32_t ring_buffer_overflow;
+} app_ctx_t;
 
-    bool last_seq_valid;
-    uint32_t last_seq;
-    bool last_fail_valid;
-    uint32_t last_fail_seq;
-    uint8_t last_fail_id;
-    uint16_t last_fail_crc_calc;
-    uint16_t last_fail_crc_rx;
-    size_t last_fail_len;
-    size_t last_fail_expected_len;
-    size_t last_fail_dump_len;
-    uint8_t last_fail_dump[FAIL_DUMP_BYTES];
-    uint32_t last_samples;
-    uint16_t last_min;
-    uint16_t last_max;
-    uint16_t last_mean;
-    uint32_t last_payload_len;
-} stats_t;
+static app_ctx_t ctx = {0};
 
-static stats_t st = {0};
-
-// Ring buffer
+// Ring buffer for UART RX
 static uint8_t rx_buffer[RX_BUFFER_SIZE];
 static volatile size_t rx_head = 0;
 static volatile size_t rx_tail = 0;
 
 static void on_uart_rx() {
     while (uart_is_readable(uart0)) {
-        // Check for errors first
-        uint32_t dr = uart_get_hw(uart0)->dr;
-        uint8_t ch = dr & 0xFF;
-        
-        if (dr & UART_UARTDR_OE_BITS) st.uart_overrun_err++;
-        if (dr & UART_UARTDR_BE_BITS) st.uart_break_err++;
-        if (dr & UART_UARTDR_PE_BITS) st.uart_parity_err++;
-        if (dr & UART_UARTDR_FE_BITS) st.uart_framing_err++;
-
+        uint8_t ch = uart_getc(uart0);
         size_t next_head = (rx_head + 1) % RX_BUFFER_SIZE;
         if (next_head != rx_tail) {
             rx_buffer[rx_head] = ch;
             rx_head = next_head;
-        } else {
-            st.ring_buffer_overflow++;
         }
     }
 }
@@ -104,155 +84,166 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
     return crc;
 }
 
-static void process_frame(const uint8_t *data, size_t len, stats_t *st) {
-    if (len < 2) {
-        st->frames_too_short++;
+// Helper to calculate mean and std dev of a buffer
+static void calc_stats(const uint16_t *data, size_t count, double *mean_out, double *std_out) {
+    if (count == 0) {
+        *mean_out = 0;
+        *std_out = 0;
         return;
     }
-    const size_t payload_len = len - 2;
-    uint32_t seq = 0;
-    if (payload_len >= SEQ_BYTES) {
-        seq = (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) |
-              ((uint32_t)data[3] << 24);
+    double sum = 0;
+    for (size_t i = 0; i < count; ++i) {
+        sum += data[i];
     }
-
-    if (payload_len < SEQ_BYTES + 1) {
-        st->frames_too_short++;
-        return;
-    }
-
-    const uint8_t sample_count = data[SEQ_BYTES];
-    // 12-bit packing: 2 samples in 3 bytes.
-    // Packed bytes = ceil(sample_count * 1.5)
-    // If sample_count is odd, we have (sample_count / 2) * 3 + 2 bytes?
-    // Let's assume sample_count is always even for simplicity in packing, or handle odd case.
-    // TX sends pairs. If odd, last one takes 2 bytes? Or maybe just ceil(count * 12 / 8).
-    // count * 12 / 8 = count * 1.5.
-    // If count=1, 1.5 -> 2 bytes.
-    // If count=2, 3 bytes.
-    // If count=40, 60 bytes.
-    size_t packed_bytes = (sample_count * 3 + 1) / 2; // Integer math for ceil(count * 1.5)
+    double mean = sum / count;
     
-    const size_t expected_len = SEQ_BYTES + 1 + packed_bytes;
-    if (payload_len != expected_len) {
-        st->frames_bad_len++;
-        st->last_fail_valid = true;
-        st->last_fail_seq = seq;
-        st->last_fail_id = payload_len > SEQ_BYTES ? data[SEQ_BYTES] : 0x00;
-        st->last_fail_len = payload_len;
-        st->last_fail_expected_len = expected_len;
-        st->last_fail_dump_len = payload_len > FAIL_DUMP_BYTES ? FAIL_DUMP_BYTES : payload_len;
-        memcpy(st->last_fail_dump, data, st->last_fail_dump_len);
-        return;
+    double sum_sq_diff = 0;
+    for (size_t i = 0; i < count; ++i) {
+        double diff = data[i] - mean;
+        sum_sq_diff += diff * diff;
     }
-    if (sample_count == 0) return;
+    *mean_out = mean;
+    *std_out = sqrt(sum_sq_diff / count);
+}
 
+static void process_samples(const uint16_t *samples, size_t count) {
+    if (count == 0) return;
+
+    switch (ctx.state) {
+        case STATE_WAIT_FOR_BASELINE: {
+            // Use this packet to establish baseline
+            calc_stats(samples, count, &ctx.baseline_mean, &ctx.baseline_std_dev);
+            ctx.baseline_valid = true;
+            printf("Baseline established: Mean=%.2f, StdDev=%.2f\n", ctx.baseline_mean, ctx.baseline_std_dev);
+            ctx.state = STATE_MONITOR;
+            break;
+        }
+
+        case STATE_MONITOR: {
+            double threshold_high = ctx.baseline_mean + 5.0 * ctx.baseline_std_dev;
+            double threshold_low = ctx.baseline_mean - 5.0 * ctx.baseline_std_dev;
+
+            for (size_t i = 0; i < count; ++i) {
+                if (samples[i] > threshold_high || samples[i] < threshold_low) {
+                    // Triggered!
+                    // Start capturing. We include the rest of this packet in the capture.
+                    ctx.state = STATE_CAPTURE;
+                    ctx.capture_idx = 0;
+                    
+                    // Copy remaining samples in this packet to capture buffer
+                    size_t remaining = count - i;
+                    size_t to_copy = (remaining > CAPTURE_BUFFER_SIZE) ? CAPTURE_BUFFER_SIZE : remaining;
+                    memcpy(&ctx.capture_buf[ctx.capture_idx], &samples[i], to_copy * sizeof(uint16_t));
+                    ctx.capture_idx += to_copy;
+                    
+                    if (ctx.capture_idx >= CAPTURE_BUFFER_SIZE) {
+                        ctx.state = STATE_REPORT;
+                    }
+                    break; // Stop processing this packet as monitor, we are now capturing or done
+                }
+            }
+            break;
+        }
+
+        case STATE_CAPTURE: {
+            size_t space_left = CAPTURE_BUFFER_SIZE - ctx.capture_idx;
+            size_t to_copy = (count > space_left) ? space_left : count;
+            
+            memcpy(&ctx.capture_buf[ctx.capture_idx], samples, to_copy * sizeof(uint16_t));
+            ctx.capture_idx += to_copy;
+
+            if (ctx.capture_idx >= CAPTURE_BUFFER_SIZE) {
+                ctx.state = STATE_REPORT;
+            }
+            break;
+        }
+
+        case STATE_REPORT:
+            // Should be handled in main loop to avoid blocking IRQ/parsing context too much, 
+            // but process_frame is called from main loop, so it's fine.
+            break;
+    }
+}
+
+static void process_frame(const uint8_t *data, size_t len) {
+    if (len < SEQ_BYTES + 1) return;
+
+    const size_t payload_len = len - 2; // minus CRC
+    // Verify CRC
     const uint16_t crc_calc = crc16_ccitt(data, payload_len);
     const uint16_t crc_rx = ((uint16_t)data[payload_len] << 8) | data[payload_len + 1];
+    
     if (crc_calc != crc_rx) {
-        st->frames_crc_fail++;
-        st->last_fail_valid = true;
-        st->last_fail_seq = seq;
-        st->last_fail_id = payload_len > SEQ_BYTES ? data[SEQ_BYTES] : 0x00;
-        st->last_fail_crc_calc = crc_calc;
-        st->last_fail_crc_rx = crc_rx;
-        st->last_fail_len = payload_len;
-        st->last_fail_expected_len = expected_len;
-        st->last_fail_dump_len = payload_len > FAIL_DUMP_BYTES ? FAIL_DUMP_BYTES : payload_len;
-        memcpy(st->last_fail_dump, data, st->last_fail_dump_len);
+        ctx.frames_crc_fail++;
         return;
     }
+    ctx.frames_ok++;
 
-    st->frames_ok++;
-    st->bytes_payload += payload_len;
-
-    if (!st->last_seq_valid) {
-        st->last_seq_valid = true;
-        st->last_seq = seq;
-    } else {
-        if (seq > st->last_seq) {
-            st->missed_frames += (seq - st->last_seq - 1);
-        } else if (seq != st->last_seq) {
-            st->seq_resets++;
-        }
-        st->last_seq = seq;
-    }
-
-    uint16_t min_v = 0xFFFF;
-    uint16_t max_v = 0;
-    uint32_t sum = 0;
-    size_t offset = SEQ_BYTES + 1;
-    
     // Unpack samples
+    uint8_t sample_count = data[SEQ_BYTES];
+    if (sample_count == 0) return;
+
+    // We need a temporary buffer for unpacked samples from this frame
+    uint16_t frame_samples[256]; // Max samples per frame is small (40), 256 is plenty safe
+    size_t unpacked_count = 0;
+    size_t offset = SEQ_BYTES + 1;
+
     for (uint8_t i = 0; i < sample_count; i += 2) {
-        // Get 3 bytes for 2 samples (or 2 bytes for 1 sample if last is odd)
+        if (offset + 2 > payload_len) break; // Should not happen if len check passed, but safety
+
         uint8_t b0 = data[offset++];
         uint8_t b1 = (i + 1 < sample_count) ? data[offset++] : 0;
         uint8_t b2 = (i + 1 < sample_count) ? data[offset++] : 0;
         
         uint16_t s0 = (uint16_t)b0 | ((uint16_t)(b1 & 0x0F) << 8);
-        if (s0 < min_v) min_v = s0;
-        if (s0 > max_v) max_v = s0;
-        sum += s0;
+        frame_samples[unpacked_count++] = s0;
         
         if (i + 1 < sample_count) {
             uint16_t s1 = (uint16_t)((b1 & 0xF0) >> 4) | ((uint16_t)b2 << 4);
-            if (s1 < min_v) min_v = s1;
-            if (s1 > max_v) max_v = s1;
-            sum += s1;
+            frame_samples[unpacked_count++] = s1;
         }
     }
-    
-    st->last_samples = sample_count;
-    st->last_min = min_v;
-    st->last_max = max_v;
-    st->last_mean = (uint16_t)(sum / sample_count);
-    st->last_payload_len = payload_len;
+
+    process_samples(frame_samples, unpacked_count);
 }
 
 int main(void) {
     stdio_init_all();
-    setvbuf(stdout, NULL, _IONBF, 0);
-
+    
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 0);
 
     uart_init(uart0, UART_BAUD);
-    uart_set_format(uart0, 8, 2, UART_PARITY_NONE);  // 2 stop bits for margin
+    uart_set_format(uart0, 8, 2, UART_PARITY_NONE);
     uart_set_fifo_enabled(uart0, true);
     gpio_set_function(RX_PIN, GPIO_FUNC_UART);
     gpio_set_function(TX_PIN, GPIO_FUNC_UART);
-    gpio_set_inover(RX_PIN, GPIO_OVERRIDE_INVERT);  // HCPL2630 inverts the signal
+    gpio_set_inover(RX_PIN, GPIO_OVERRIDE_INVERT);
 
-    // Setup interrupt
     irq_set_exclusive_handler(UART0_IRQ, on_uart_rx);
     irq_set_enabled(UART0_IRQ, true);
     uart_set_irq_enables(uart0, true, false);
 
-    sleep_ms(2000);  // allow USB CDC to enumerate
-    printf("RX ready: UART0 GP1 inverted, %u baud, SLIP+CRC16 listening...\n", UART_BAUD);
-    printf("RX features: Interrupt-driven, Ring Buffer %d bytes, 12-bit unpacking\n", RX_BUFFER_SIZE);
+    sleep_ms(2000);
+    printf("RX Triggered Mode Ready. Waiting for baseline...\n");
 
     uint8_t frame_buf[MAX_FRAME];
     size_t frame_len = 0;
     bool esc = false;
     bool overflow = false;
-    uint64_t last_byte_ms = to_ms_since_boot(get_absolute_time());
-    uint64_t last_report_ms = last_byte_ms;
-    uint64_t last_led_ms = last_byte_ms;
+    uint64_t last_led_ms = to_ms_since_boot(get_absolute_time());
+
+    ctx.state = STATE_WAIT_FOR_BASELINE;
 
     while (true) {
-        // Process ring buffer
+        // Process Ring Buffer
         while (rx_head != rx_tail) {
             uint8_t b = rx_buffer[rx_tail];
             rx_tail = (rx_tail + 1) % RX_BUFFER_SIZE;
-            
-            last_byte_ms = to_ms_since_boot(get_absolute_time());
 
             if (overflow) {
                 if (b == SLIP_END) {
-                    st.frames_too_long++;
                     frame_len = 0;
                     esc = false;
                     overflow = false;
@@ -262,7 +253,7 @@ int main(void) {
 
             if (b == SLIP_END) {
                 if (frame_len > 0) {
-                    process_frame(frame_buf, frame_len, &st);
+                    process_frame(frame_buf, frame_len);
                     frame_len = 0;
                 }
                 esc = false;
@@ -287,47 +278,36 @@ int main(void) {
             }
         }
 
-        const uint64_t now_ms = to_ms_since_boot(get_absolute_time());
-        if (frame_len > 0 && (now_ms - last_byte_ms) > FRAME_TIMEOUT_MS) {
-            st.frames_timeout++;
-            frame_len = 0;
-            esc = false;
-            overflow = false;
+        // Handle Reporting
+        if (ctx.state == STATE_REPORT) {
+            double mean, std;
+            uint16_t min_v = 0xFFFF;
+            uint16_t max_v = 0;
+            
+            calc_stats(ctx.capture_buf, CAPTURE_BUFFER_SIZE, &mean, &std);
+            
+            for(int i=0; i<CAPTURE_BUFFER_SIZE; i++) {
+                if(ctx.capture_buf[i] < min_v) min_v = ctx.capture_buf[i];
+                if(ctx.capture_buf[i] > max_v) max_v = ctx.capture_buf[i];
+            }
+
+            printf("\n--- TRIGGERED EVENT ---\n");
+            printf("Stats: Min=%u, Max=%u, Mean=%.2f\n", min_v, max_v, mean);
+            printf("First 10 raw values:\n");
+            for (int i = 0; i < 10 && i < CAPTURE_BUFFER_SIZE; i++) {
+                printf("%u\n", ctx.capture_buf[i]);
+            }
+            printf("-----------------------\n");
+
+            // Reset to monitor
+            ctx.state = STATE_MONITOR;
         }
 
-        if (now_ms - last_led_ms >= 1000) {
+        // Heartbeat Blink
+        uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+        if (now_ms - last_led_ms >= 500) {
             last_led_ms = now_ms;
             gpio_xor_mask(1u << LED_PIN);
-        }
-
-        if (now_ms - last_report_ms >= STATS_PERIOD_MS) {
-            last_report_ms = now_ms;
-            printf("RX stats ok=%lu crc_fail=%lu too_short=%lu too_long=%lu bad_len=%lu timeout=%lu bytes=%lu missed_frames=%lu seq_resets=%lu\n",
-                   (unsigned long)st.frames_ok, (unsigned long)st.frames_crc_fail,
-                   (unsigned long)st.frames_too_short, (unsigned long)st.frames_too_long,
-                   (unsigned long)st.frames_bad_len, (unsigned long)st.frames_timeout,
-                   (unsigned long)st.bytes_payload, (unsigned long)st.missed_frames,
-                   (unsigned long)st.seq_resets);
-            printf("RX errs  overrun=%lu break=%lu parity=%lu framing=%lu rb_overflow=%lu\n",
-                   (unsigned long)st.uart_overrun_err, (unsigned long)st.uart_break_err,
-                   (unsigned long)st.uart_parity_err, (unsigned long)st.uart_framing_err,
-                   (unsigned long)st.ring_buffer_overflow);
-            
-            if (st.last_samples > 0) {
-                printf(" last_ok seq=%lu samples=%lu len=%lu mean=%u min=%u max=%u\n",
-                       (unsigned long)st.last_seq, (unsigned long)st.last_samples,
-                       (unsigned long)st.last_payload_len, st.last_mean, st.last_min, st.last_max);
-            }
-            if (st.last_fail_valid) {
-                printf(" last_fail seq=%lu id=0x%02X len=%lu exp_len=%lu crc_rx=0x%04X crc_calc=0x%04X dump=",
-                       (unsigned long)st.last_fail_seq, st.last_fail_id, (unsigned long)st.last_fail_len,
-                       (unsigned long)st.last_fail_expected_len, st.last_fail_crc_rx, st.last_fail_crc_calc);
-                for (size_t i = 0; i < st.last_fail_dump_len; ++i) {
-                    printf("%02X", st.last_fail_dump[i]);
-                }
-                printf("\n");
-            }
-            printf("\n");
         }
     }
 }
