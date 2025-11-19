@@ -1,5 +1,7 @@
 # Isolated Current Measurement Link (RP2040 Zero → HCPL2630 → Pico)
 
+This is a development project that will enable the measurment of the current (and potentiall later differential voltage) of a high voltage high current pulse generator (Medical Purposes, pulsed electric fields) and safely transfer the data to a computer for analysis. The project is based on the RP2040 Zero and the Raspberry Pi Pico but the pico is just a placeholder for the rpi 4b that will be the final recipient. Goal is to have a compact and reliable solution that can transfer the data during a pulse quickly with at least 100ksps to the computer. Since the comptuer gives the "go" signal for the pulses and duplex would be more difficult to implement this is unidirectional so the data is basically streaming non stop and the recipient will have to decide when to read it or not. Until this is rock solid and proven to be reliable it will be a development project with a sacrifical rpi pico as recipient and a sacrifical rp2040 zero as transmitter. 
+
 ## Overview
 - TX (RP2040 Zero) reads an ACS712 current sensor on ADC0 (GPIO26), low-passes it with 9 kΩ / 1 nF, samples at a configured rate, and streams samples over UART0 through a HCPL-2630 isolator.
 - RX (Raspberry Pi Pico) receives on UART0 (inverted), SLIP-decodes frames, CRC-checks, tracks sequence gaps, and prints stats plus mean/min/max of the last good packet over USB-CDC (115200 baud).
@@ -32,6 +34,7 @@
   - GND → TX ground. Add 100 nF + 1 µF decoupling at the module.
   - OUT → ADC0 (GPIO26) through 9 kΩ series resistor.
   - 1 nF from ADC0 to GND (after the 9 kΩ) for RC anti-alias filter.
+  - 15 kohm from ADC to GND as voltage divider as the output of the ACS712 is 5V peak otherwise.
   - Optional: Schottky clamps to 3.3 V and GND at ADC pin for over/under-voltage protection.
 
 ### UART / isolation path
