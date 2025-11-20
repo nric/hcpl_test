@@ -30,6 +30,9 @@
 #define RX_BUFFER_SIZE 8192
 
 #define CAPTURE_BUFFER_SIZE 1000
+#define CALIBRATION_TARGET_SAMPLES 40000 // ~1 second at 40ksps
+#define TRIGGER_SIGMA 6.0
+#define TRIGGER_CONSECUTIVE_SAMPLES 3
 
 typedef enum {
     STATE_WAIT_FOR_BASELINE,
@@ -41,10 +44,18 @@ typedef enum {
 typedef struct {
     rx_state_t state;
     
-    // Baseline stats
+    // Baseline stats accumulation
+    double calibration_sum;
+    double calibration_sum_sq;
+    size_t calibration_count;
+
+    // Final Baseline
     double baseline_mean;
     double baseline_std_dev;
     bool baseline_valid;
+
+    // Trigger Debouncing
+    size_t trigger_consecutive;
 
     // Capture buffer
     uint16_t capture_buf[CAPTURE_BUFFER_SIZE];
@@ -111,35 +122,70 @@ static void process_samples(const uint16_t *samples, size_t count) {
 
     switch (ctx.state) {
         case STATE_WAIT_FOR_BASELINE: {
-            // Use this packet to establish baseline
-            calc_stats(samples, count, &ctx.baseline_mean, &ctx.baseline_std_dev);
-            ctx.baseline_valid = true;
-            printf("Baseline established: Mean=%.2f, StdDev=%.2f\n", ctx.baseline_mean, ctx.baseline_std_dev);
-            ctx.state = STATE_MONITOR;
+            for (size_t i = 0; i < count; ++i) {
+                ctx.calibration_sum += samples[i];
+                ctx.calibration_sum_sq += (double)samples[i] * samples[i];
+                ctx.calibration_count++;
+
+                if (ctx.calibration_count >= CALIBRATION_TARGET_SAMPLES) {
+                    // Calculate final stats
+                    ctx.baseline_mean = ctx.calibration_sum / ctx.calibration_count;
+                    double variance = (ctx.calibration_sum_sq / ctx.calibration_count) - (ctx.baseline_mean * ctx.baseline_mean);
+                    ctx.baseline_std_dev = sqrt(variance);
+                    
+                    ctx.baseline_valid = true;
+                    printf("Baseline established over %zu samples: Mean=%.2f, StdDev=%.2f\n", 
+                           ctx.calibration_count, ctx.baseline_mean, ctx.baseline_std_dev);
+                    
+                    ctx.state = STATE_MONITOR;
+                    
+                    // Reset trigger state
+                    ctx.trigger_consecutive = 0;
+
+                    // Stop processing this packet as baseline (any remaining samples are ignored or could be monitored)
+                    // For simplicity, we just switch state and will start monitoring on next packet or remaining samples
+                    // Let's process remaining samples in this packet as MONITOR to avoid gaps
+                    size_t remaining = count - 1 - i;
+                    if (remaining > 0) {
+                         // Recursive call or just fall through? 
+                         // Simpler to just return and let next packet handle it, 
+                         // or loop here? Let's just break and drop a few samples, it's safer.
+                    }
+                    return; 
+                }
+            }
             break;
         }
 
         case STATE_MONITOR: {
-            double threshold_high = ctx.baseline_mean + 5.0 * ctx.baseline_std_dev;
-            double threshold_low = ctx.baseline_mean - 5.0 * ctx.baseline_std_dev;
+            double threshold_high = ctx.baseline_mean + TRIGGER_SIGMA * ctx.baseline_std_dev;
+            double threshold_low = ctx.baseline_mean - TRIGGER_SIGMA * ctx.baseline_std_dev;
 
             for (size_t i = 0; i < count; ++i) {
                 if (samples[i] > threshold_high || samples[i] < threshold_low) {
-                    // Triggered!
-                    // Start capturing. We include the rest of this packet in the capture.
-                    ctx.state = STATE_CAPTURE;
-                    ctx.capture_idx = 0;
+                    ctx.trigger_consecutive++;
                     
-                    // Copy remaining samples in this packet to capture buffer
-                    size_t remaining = count - i;
-                    size_t to_copy = (remaining > CAPTURE_BUFFER_SIZE) ? CAPTURE_BUFFER_SIZE : remaining;
-                    memcpy(&ctx.capture_buf[ctx.capture_idx], &samples[i], to_copy * sizeof(uint16_t));
-                    ctx.capture_idx += to_copy;
-                    
-                    if (ctx.capture_idx >= CAPTURE_BUFFER_SIZE) {
-                        ctx.state = STATE_REPORT;
+                    if (ctx.trigger_consecutive >= TRIGGER_CONSECUTIVE_SAMPLES) {
+                        // Triggered!
+                        ctx.state = STATE_CAPTURE;
+                        ctx.capture_idx = 0;
+                        printf("Triggered! Value=%u (Mean=%.2f, Sigma=%.2f)\n", samples[i], ctx.baseline_mean, ctx.baseline_std_dev);
+
+                        // Start capturing from the current sample (or potentially 'i - consecutive + 1' if we want to capture the spike start)
+                        // Let's capture from 'i' for now.
+                        
+                        size_t remaining = count - i;
+                        size_t to_copy = (remaining > CAPTURE_BUFFER_SIZE) ? CAPTURE_BUFFER_SIZE : remaining;
+                        memcpy(&ctx.capture_buf[ctx.capture_idx], &samples[i], to_copy * sizeof(uint16_t));
+                        ctx.capture_idx += to_copy;
+                        
+                        if (ctx.capture_idx >= CAPTURE_BUFFER_SIZE) {
+                            ctx.state = STATE_REPORT;
+                        }
+                        return; // Done with this packet
                     }
-                    break; // Stop processing this packet as monitor, we are now capturing or done
+                } else {
+                    ctx.trigger_consecutive = 0;
                 }
             }
             break;
@@ -159,8 +205,6 @@ static void process_samples(const uint16_t *samples, size_t count) {
         }
 
         case STATE_REPORT:
-            // Should be handled in main loop to avoid blocking IRQ/parsing context too much, 
-            // but process_frame is called from main loop, so it's fine.
             break;
     }
 }
